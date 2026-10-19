@@ -430,9 +430,28 @@ static void printStatus() {
 static void handleSerial() {
   static char line[32];
   static int len = 0;
+  static uint32_t resetAskedAt = 0; // 0 = no confirmation pending
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\r' || c == '\n') {
+      // Answer to the factory reset question. Expires after 30 s; a bare
+      // Enter or anything but y/yes means No.
+      if (resetAskedAt != 0 && millis() - resetAskedAt > 30000)
+        resetAskedAt = 0;
+      if (resetAskedAt != 0) {
+        line[len] = '\0';
+        len = 0;
+        resetAskedAt = 0;
+        Serial.println();
+        if (strcasecmp(line, "y") == 0 || strcasecmp(line, "yes") == 0) {
+          Serial.println("Factory reset - rebooting...");
+          cfg.resetDefaults();
+          delay(100);
+          ESP.restart();
+        }
+        Serial.println("Factory reset cancelled");
+        continue;
+      }
       if (len == 0)
         continue;
       line[len] = '\0';
@@ -445,10 +464,8 @@ static void handleSerial() {
         delay(100);
         ESP.restart();
       } else if (strcmp(line, "reset") == 0) {
-        Serial.println("Factory reset - rebooting...");
-        cfg.resetDefaults();
-        delay(100);
-        ESP.restart();
+        Serial.print("Erase all settings and restore factory defaults? Are you sure? (y/N): ");
+        resetAskedAt = millis();
       } else {
         Serial.println("Commands: status, reboot, reset (factory defaults)");
       }
