@@ -29,7 +29,7 @@
 #define DEF_HOST_PWD "changeme" // Host password in voter.conf
 #endif
 #ifndef DEF_TIMING_OFFSET_MS
-#define DEF_TIMING_OFFSET_MS -120
+#define DEF_TIMING_OFFSET_MS 0 // trim on top of the built-in client/master offset
 #endif
 
 // --- Network ---

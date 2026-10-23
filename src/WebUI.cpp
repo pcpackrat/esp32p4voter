@@ -116,7 +116,8 @@ static void handleRoot() {
           "<tr><td>RSSI pin (raw ADC counts)</td><td id=\"rssiraw\">-</td></tr>"
           "<tr><td>ADC peak (1s)</td><td id=\"adcpk\">-</td></tr>"
           "<tr><td>Encoder peak (1s, 0 dB = uLaw clip)</td><td id=\"encpk\">-</td></tr>"
-          "<tr><td>Sample clock vs GPS</td><td id=\"ppm\">-</td></tr>"
+          "<tr><td>Audio clock (locked to GPS PPS)</td><td id=\"ppm\">-</td></tr>"
+          "<tr><td>Frame age at send (GPS now - frame start)</td><td id=\"sage\">-</td></tr>"
           "<tr><td>Frames captured / dropped / I2S read errors</td><td id=\"frames\">-</td></tr>"
           "<tr><td>Codec (ES8311)</td><td id=\"codec\">-</td></tr>"
           "</table></div>";
@@ -158,7 +159,8 @@ static void handleRoot() {
           "st('cos',s.cos?'OPEN':'closed',s.cos);st('rssi',s.rssi+(s.hwrssi?' (hardware)':' (DSP)'));"
           "st('noise',s.noise);st('rssiraw',s.rssiraw);"
           "st('adcpk',db(s.adcpk)+' FS');st('encpk',db(s.encpk),s.encpk<-1);"
-          "st('ppm',s.ppmok?s.ppm.toFixed(2)+' ppm':'measuring (needs GPS lock, ~60s)');"
+          "st('ppm',s.aclk+', '+s.ppm.toFixed(2)+' ppm, PPS phase error '+s.phus.toFixed(1)+' us',s.aclk=='LOCKED');"
+          "st('sage','avg '+s.sage.toFixed(1)+' ms, max '+s.smax.toFixed(1)+' ms');"
           "st('frames',s.cap+' / '+s.drop+' / '+s.rderr);st('codec',s.codec?'OK':'NOT FOUND',s.codec);"
           "st('ptt',s.ptt?'KEYED':'off',!s.ptt);st('txframes',s.hostfr+' / '+s.played);"
           "st('jb',s.jb+' bytes'+(s.jbbuf?' (buffering)':''));st('txpk',db(s.txpk)+' FS');st('wrerr',s.wrerr);"
@@ -215,7 +217,7 @@ static void handleApiStatus() {
   snprintf(buf, sizeof(buf),
            "{\"voter\":\"%s\",\"host\":\"%s\",\"sent\":%lu,\"rpt\":\"%s\","
            "\"cos\":%s,\"rssi\":%u,\"hwrssi\":%s,\"rssiraw\":%u,\"noise\":%u,\"adcpk\":%.1f,\"encpk\":%.1f,"
-           "\"ppm\":%.2f,\"ppmok\":%s,\"cap\":%lu,\"drop\":%lu,\"rderr\":%lu,\"codec\":%s,"
+           "\"ppm\":%.2f,\"ppmok\":%s,\"aclk\":\"%s\",\"phus\":%.1f,\"sage\":%.1f,\"smax\":%.1f,\"cap\":%lu,\"drop\":%lu,\"rderr\":%lu,\"codec\":%s,"
            "\"ptt\":%s,\"hostfr\":%lu,\"played\":%lu,\"jb\":%u,\"jbbuf\":%s,\"txpk\":%.1f,\"wrerr\":%lu,"
            "\"gps\":\"%s\",\"sats\":%lu,\"utc\":\"%s\",\"jit\":%lu,"
            "\"nmea\":%lu,\"nmok\":%lu,\"nmbad\":%lu,\"nmage\":%ld,\"ppsok\":%s,\"tmode\":\"%s\","
@@ -227,7 +229,9 @@ static void handleApiStatus() {
            (unsigned)g_status.rssi, cfg.data.useHwRSSI ? "true" : "false",
            (unsigned)g_status.rssiRaw, (unsigned)g_status.noise, peakDb(g_status.adcPeak, 32768.0f),
            peakDb(g_status.encPeak, (float)ULAW_CLIP_LEVEL), (double)g_status.clockPpm,
-           g_status.clockPpmValid ? "true" : "false", (unsigned long)g_status.framesCaptured,
+           g_status.clockPpmValid ? "true" : "false", GpsAudio::stateStr(gpsAudio.state()),
+           (double)gpsAudio.phaseErrUs(), (double)g_status.sendAgeAvgMs, (double)g_status.sendAgeMaxMs,
+           (unsigned long)g_status.framesCaptured,
            (unsigned long)g_status.framesDropped, (unsigned long)g_status.readErrors,
            g_status.codecOk ? "true" : "false", g_status.ptt ? "true" : "false",
            (unsigned long)voter.getHostFramesReceived(), (unsigned long)g_status.framesPlayed,
@@ -266,7 +270,7 @@ static void handleVoter() {
   html += "<label><input type=\"checkbox\" onclick=\"toggleShow('clientPwd')\"> Show</label>";
   html += "<label>Host Password:</label><input type=\"password\" id=\"hostPwd\" name=\"hostPwd\" maxlength=\"19\" value=\"" + htmlEscape(cfg.data.hostPwd) + "\">";
   html += "<label><input type=\"checkbox\" onclick=\"toggleShow('hostPwd')\"> Show</label>";
-  html += "<label>Timing Offset (ms):</label><input type=\"number\" name=\"timingOffset\" min=\"-1000\" max=\"1000\" value=\"" + String(cfg.data.timingOffsetMs) + "\">";
+  html += "<label>Timing Trim (ms, normally 0; added to the built-in offset: client -100, master -120):</label><input type=\"number\" name=\"timingOffset\" min=\"-1000\" max=\"1000\" value=\"" + String(cfg.data.timingOffsetMs) + "\">";
   html += "<input type=\"submit\" value=\"Save &amp; Reboot\" class=\"btn\"></form></div>";
   html += htmlFooter();
   webServer.send(200, "text/html", html);

@@ -2,6 +2,7 @@
 #define APP_H
 
 #include "GPSManager.h"
+#include "GpsAudio.h"
 #include "VoterClient.h"
 #include <Arduino.h>
 
@@ -21,6 +22,8 @@ struct RxStatus {
   volatile uint32_t readErrors;     // I2S read errors
   volatile float clockPpm;          // Sample clock error vs GPS PPS
   volatile bool clockPpmValid;
+  volatile float sendAgeAvgMs;      // GPS now - frame start, at send (last second)
+  volatile float sendAgeMaxMs;
 
   // TX
   volatile bool ptt;               // PTT output active
@@ -51,6 +54,7 @@ extern RssiCalMeasure g_rssiCal;
 // readings. Works either way round (RSSI voltage or noise falling with signal).
 uint8_t rssiFromCal(float v, float atNoSig, float atFull);
 extern GPSManager gps;
+extern GpsAudio gpsAudio;
 extern VoterClient voter;
 extern volatile uint32_t g_rebootAt; // millis() to restart at, 0 = none
 

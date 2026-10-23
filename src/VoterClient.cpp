@@ -75,12 +75,8 @@ VoterClient::VoterClient() {
   memset(_myChallenge, 0, sizeof(_myChallenge));
   memset(_serverChallenge, 0, sizeof(_serverChallenge));
   _isTransmitting = false;
-  _timingOffsetMs = -120;
+  _timingOffsetMs = 0;
   _lastCallTime = 0;
-  _anchorSec = 0;
-  _anchorNsec = 0;
-  _burstPacketCount = 0;
-  _anchorActive = false;
   _gpSeq = 0;
   _lastHostAudioTime = 0;
   _hostFramesReceived = 0;
@@ -88,6 +84,8 @@ VoterClient::VoterClient() {
 
 void VoterClient::begin(GPSManager *gps, const char *clientPwd, const char *hostPwd,
                         uint16_t localPort) {
+  if (!_lock)
+    _lock = xSemaphoreCreateMutex();
   _gps = gps;
   _clientPwd = clientPwd;
   _hostPwd = hostPwd;
@@ -129,11 +127,19 @@ void VoterClient::statusText(char *buf, size_t len) {
   } else if (_gps && !_gps->isLocked()) {
     // The client only connects with GPS lock
     snprintf(buf, len, "WAITING FOR GPS (%s)", GPSManager::statusStr(_gps->getLockStatus()));
+  } else if (!_timingReady()) {
+    snprintf(buf, len, "WAITING FOR AUDIO CLOCK (%s)", _notReadyFn ? _notReadyFn() : "not locked");
   } else if (_state == VOTER_AUTHENTICATING) {
     snprintf(buf, len, "AUTHENTICATING");
   } else {
     snprintf(buf, len, "CONNECTING");
   }
+}
+
+bool VoterClient::_timingReady() {
+  if (!_gps || !_gps->isLocked())
+    return false;
+  return _readyFn ? _readyFn() : true;
 }
 
 void VoterClient::_send(const uint8_t *data, size_t len) {
@@ -145,8 +151,14 @@ void VoterClient::_send(const uint8_t *data, size_t len) {
 }
 
 void VoterClient::update() {
-  if (!_started)
+  if (!_started || !_lock)
     return;
+  xSemaphoreTake(_lock, portMAX_DELAY);
+  _update();
+  xSemaphoreGive(_lock);
+}
+
+void VoterClient::_update() {
 
   // 1. Incoming
   int packetSize = _udp.parsePacket();
@@ -163,7 +175,7 @@ void VoterClient::update() {
     if (millis() - _lastAttemptTime > 2000) {
       _lastAttemptTime = millis();
       // Only connect with GPS lock
-      if (_gps && _gps->isLocked()) {
+      if (_timingReady()) {
         _hasWarnedGpsWaitConnect = false;
         _sendAuthPacket();
       } else if (!_hasWarnedGpsWaitConnect) {
@@ -189,7 +201,7 @@ void VoterClient::update() {
     }
   } else if (_state == VOTER_CONNECTED) {
     // 3. GPS lock loss (debounced, 1s holdover)
-    if (_gps && !_gps->isLocked()) {
+    if (!_timingReady()) {
       if (_gpsLostTime == 0) {
         _gpsLostTime = millis();
       }
@@ -372,7 +384,7 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
     // A matching digest is sufficient to be connected (matches PIC/STM32
     // reference) - but never without GPS lock.
     if (_state != VOTER_CONNECTED) {
-      if (_gps && !_gps->isLocked()) {
+      if (!_timingReady()) {
         return;
       }
       Serial.println("[Voter] Authentication Successful! Connected to Host.");
@@ -411,50 +423,29 @@ void VoterClient::_handleProxyAudioPacket(const uint8_t *data, int len) {
 }
 
 void VoterClient::processAudioFrame(const uint8_t *ulawData, uint8_t rssi, VTIME frameTime) {
+  if (!_lock)
+    return;
+  xSemaphoreTake(_lock, portMAX_DELAY);
   if (_state != VOTER_CONNECTED) {
+    xSemaphoreGive(_lock);
     return;
   }
 
   PROXY_AUDIO_PACKET pkt;
   memset(&pkt, 0, sizeof(pkt));
 
-  // Rule 1: Anchor at the start of a run of consecutive frames (a
-  // transmission, or the continuous stream when master), then count frames.
-  // Re-anchor if the count drifts a frame from GPS - the codec clock is not
-  // locked to GPS (~-24 ppm: one correction every ~14 min).
-  uint64_t frameNs = (uint64_t)frameTime.vtime_sec * 1000000000ULL + frameTime.vtime_nsec;
-  bool continuing = _anchorActive && (millis() - _lastCallTime < 100);
-  if (continuing) {
-    uint64_t expected = (uint64_t)_anchorSec * 1000000000ULL + _anchorNsec +
-                        (uint64_t)_burstPacketCount * 20000000ULL;
-    int64_t err = (int64_t)(frameNs - expected);
-    if (err > 15000000LL || err < -15000000LL)
-      continuing = false;
-  }
-  if (!continuing) {
-    _anchorSec = frameTime.vtime_sec;
-    _anchorNsec = frameTime.vtime_nsec;
-    _burstPacketCount = 0;
-    _anchorActive = true;
-  }
-
-  // Rule 2: CurrentTime = Anchor + FramesSent * 20ms
-  uint64_t totalNsec = (uint64_t)_anchorSec * 1000000000ULL + _anchorNsec;
-  totalNsec += (uint64_t)_burstPacketCount * 20000000ULL;
-
-  // Rule 3: Delay offset
-  int64_t t = (int64_t)totalNsec + (int64_t)_timingOffsetMs * 1000000LL;
+  // frameTime is the exact GPS time of the frame's first sample (GpsAudio
+  // grid), shifted onto the PIC timeline (client or master base + trim).
+  int64_t t = (int64_t)frameTime.vtime_sec * 1000000000LL + frameTime.vtime_nsec +
+              (int64_t)timingOffsetMs() * 1000000LL;
   if (t < 0)
     t = 0;
-  pkt.header.curtime.vtime_sec = (uint32_t)(t / 1000000000LL);
-  pkt.header.curtime.vtime_nsec = (uint32_t)(t % 1000000000LL);
+  pkt.header.curtime.vtime_sec = my_htonl((uint32_t)(t / 1000000000LL));
+  pkt.header.curtime.vtime_nsec = my_htonl((uint32_t)(t % 1000000000LL));
 
-  _burstPacketCount++;
   _lastCallTime = millis();
   _isTransmitting = (rssi > 0);
 
-  pkt.header.curtime.vtime_sec = my_htonl(pkt.header.curtime.vtime_sec);
-  pkt.header.curtime.vtime_nsec = my_htonl(pkt.header.curtime.vtime_nsec);
   memcpy(pkt.header.challenge, _myChallenge, VOTER_CHALLENGE_LEN);
   pkt.header.digest = my_htonl(_myDigest);
   pkt.header.payload_type = my_htons(PAYLOAD_ULAW);
@@ -464,4 +455,5 @@ void VoterClient::processAudioFrame(const uint8_t *ulawData, uint8_t rssi, VTIME
 
   _send((uint8_t *)&pkt, sizeof(pkt));
   _audioFramesSent++;
+  xSemaphoreGive(_lock);
 }

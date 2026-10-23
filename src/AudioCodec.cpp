@@ -7,10 +7,52 @@ static i2s_chan_handle_t s_rxChan = nullptr;
 static int16_t s_rxBuf[AUDIO_FRAME_SAMPLES * 2]; // stereo frames
 static int16_t s_txBuf[AUDIO_FRAME_SAMPLES * 2];
 
+// Capture: the RX DMA ISR copies each completed buffer into s_ring, indexed
+// by the same running sample count it timestamps. Every sample's index and
+// capture time come from one place - no driver queue in between, so nothing
+// can slip (the driver's own RX queue is never read).
+#define RX_RING 4096 // mono samples, power of 2 (~0.5 s)
+static int16_t s_ring[RX_RING];
+static portMUX_TYPE s_dmaMux = portMUX_INITIALIZER_UNLOCKED;
+static uint64_t s_dmaCount = 0; // samples written to s_ring (ISR only writes)
+static int64_t s_dmaUs = 0;     // esp_timer time of the latest completion
+static TaskHandle_t s_reader = nullptr;
+static uint64_t s_readIdx = 0;
+static volatile uint32_t s_rxOverruns = 0;
+
+static bool IRAM_ATTR onRxDone(i2s_chan_handle_t handle, i2s_event_data_t *event, void *user) {
+  int64_t now = esp_timer_get_time();
+  const int16_t *src = (const int16_t *)event->dma_buf;
+  size_t frames = event->size / (2 * sizeof(int16_t)); // stereo 16-bit
+  uint64_t base = s_dmaCount;
+  for (size_t i = 0; i < frames; i++)
+    s_ring[(base + i) & (RX_RING - 1)] = src[i * 2 + AUDIO_RX_SLOT];
+  portENTER_CRITICAL_ISR(&s_dmaMux);
+  s_dmaCount = base + frames;
+  s_dmaUs = now;
+  portEXIT_CRITICAL_ISR(&s_dmaMux);
+  BaseType_t woken = pdFALSE;
+  if (s_reader)
+    vTaskNotifyGiveFromISR(s_reader, &woken);
+  return woken == pdTRUE;
+}
+
+void AudioCodec::dmaSnapshot(uint64_t *count, int64_t *us) {
+  portENTER_CRITICAL(&s_dmaMux);
+  *count = s_dmaCount;
+  *us = s_dmaUs;
+  portEXIT_CRITICAL(&s_dmaMux);
+}
+
+uint32_t AudioCodec::rxOverflows() const { return s_rxOverruns; }
+
 bool AudioCodec::begin(int mclk, int bclk, int ws, int dout, int din) {
   i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-  chanCfg.dma_desc_num = 6;
-  chanCfg.dma_frame_num = AUDIO_FRAME_SAMPLES;
+  // 1 ms DMA buffers: RX audio reaches the GPS framer within ~1 ms of
+  // capture (a master's send latency is part of every site's TX timing).
+  // 64 buffers = 64 ms of slack each way.
+  chanCfg.dma_desc_num = 64;
+  chanCfg.dma_frame_num = AUDIO_DMA_SAMPLES;
   chanCfg.auto_clear = true; // TX underrun plays silence, not stale audio
 
   esp_err_t err = i2s_new_channel(&chanCfg, &s_txChan, &s_rxChan);
@@ -44,6 +86,10 @@ bool AudioCodec::begin(int mclk, int bclk, int ws, int dout, int din) {
     return false;
   }
 
+  i2s_event_callbacks_t rxCbs = {};
+  rxCbs.on_recv = onRxDone; // the driver's RX queue is unused (it just drops old entries)
+  i2s_channel_register_event_callback(s_rxChan, &rxCbs, nullptr);
+
   // Preload TX with silence so the first enable doesn't play garbage
   memset(s_txBuf, 0, sizeof(s_txBuf));
   size_t loaded = 0;
@@ -62,17 +108,27 @@ bool AudioCodec::begin(int mclk, int bclk, int ws, int dout, int din) {
   return true;
 }
 
-bool AudioCodec::readFrame(int16_t *out, int64_t *readTimeUs) {
-  size_t got = 0;
-  esp_err_t err = i2s_channel_read(s_rxChan, s_rxBuf, sizeof(s_rxBuf), &got, portMAX_DELAY);
-  if (readTimeUs)
-    *readTimeUs = esp_timer_get_time();
-  if (err != ESP_OK || got != sizeof(s_rxBuf))
-    return false;
-
-  for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
-    out[i] = s_rxBuf[i * 2 + AUDIO_RX_SLOT];
+bool AudioCodec::readSamples(int16_t *out, int n, uint64_t *startIdx) {
+  if (!s_reader)
+    s_reader = xTaskGetCurrentTaskHandle();
+  for (;;) {
+    uint64_t w;
+    portENTER_CRITICAL(&s_dmaMux);
+    w = s_dmaCount;
+    portEXIT_CRITICAL(&s_dmaMux);
+    if (w - s_readIdx > (uint64_t)(RX_RING - 2 * n)) {
+      s_readIdx = w - n; // reader fell behind the ring - skip to the newest
+      s_rxOverruns = s_rxOverruns + 1;
+    }
+    if (w - s_readIdx >= (uint64_t)n)
+      break;
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100)) == 0)
+      return false; // no audio for 100 ms
   }
+  for (int i = 0; i < n; i++)
+    out[i] = s_ring[(s_readIdx + i) & (RX_RING - 1)];
+  *startIdx = s_readIdx;
+  s_readIdx += n;
   return true;
 }
 

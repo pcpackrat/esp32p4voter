@@ -22,6 +22,7 @@
 #include "Config.h"
 #include "DSPProcessor.h"
 #include "ES8311.h"
+#include "GpsAudio.h"
 #include "GPSManager.h"
 #include "Logger.h"
 #include "NetManager.h"
@@ -47,14 +48,12 @@ static ES8311 codec;
 struct AudioFrame {
   uint8_t ulaw[AUDIO_FRAME_SAMPLES];
   uint8_t rssi;
-  VTIME time;
+  VTIME time; // GPS time of the first sample (exact 20 ms grid)
 };
 static QueueHandle_t s_frameQueue = nullptr;
 
-// Sample counter for measuring the codec sample clock against GPS PPS
-static portMUX_TYPE s_audioMux = portMUX_INITIALIZER_UNLOCKED;
-static uint64_t s_sampleCount = 0;
-static int64_t s_lastReadUs = 0;
+// GPS-locked audio timebase: frames on the GPS 20 ms grid, like the PIC
+GpsAudio gpsAudio;
 
 static bool cosInputActive() {
   int level = digitalRead(PIN_COS);
@@ -86,161 +85,216 @@ uint8_t rssiFromCal(float v, float atNoSig, float atFull) {
 }
 
 // -----------------------------------------------------------------------------
-// RX task: radio -> host
+// RX: radio -> host
 // -----------------------------------------------------------------------------
-static void rxTask(void *arg) {
-  static int16_t pcm[AUDIO_FRAME_SAMPLES];
+// One 20 ms frame: DSP, RSSI, squelch, status. When 'send' is set the frame
+// is on the GPS grid and is queued for the host, stamped 'slot'.
+static void processFrame(int16_t *pcm, bool send, const VTIME &slot) {
   static AudioFrame frame;
-  int tailCount = 0;
-  int16_t adcPeak = 0;
-  int16_t encPeak = 0;
-  int peakFrames = 0;
+  static int tailCount = 0;
+  static int16_t adcPeak = 0;
+  static int16_t encPeak = 0;
+  static int peakFrames = 0;
+
+  for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
+    int16_t a = absPeak(pcm[i]);
+    if (a > adcPeak)
+      adcPeak = a;
+  }
+
+  // The host can ask for flat audio / no PL filter (voter.conf nodeemp,
+  // hostdeemp, noplfilter) - its request wins over the local setting
+  uint8_t baseRSSI = dsp.process(pcm, cfg.data.enablePLFilter && !voter.hostNoPlFilter(),
+                                 cfg.data.enableDeemp && !voter.hostFlatAudio());
+
+  uint16_t rssiRaw = readRssiRaw();
+  float noiseRms = dsp.getNoiseRms();
+  g_status.rssiRaw = rssiRaw;
+  g_status.noiseRms = noiseRms;
+
+  // RSSI 0-255, the same scale as the VOTER boards (chan_voter compares the
+  // raw byte). Uncalibrated DSP RSSI is already 10-255 from dsp.process().
+  if (cfg.data.useHwRSSI) {
+    // rssiMin = counts at no signal, rssiMax = counts at full quieting
+    baseRSSI = rssiFromCal(rssiRaw, cfg.data.rssiMin, cfg.data.rssiMax);
+  } else if (cfg.data.dspRmsNoSig > 0.0f && cfg.data.dspRmsFull > 0.0f) {
+    baseRSSI = rssiFromCal(noiseRms, cfg.data.dspRmsNoSig, cfg.data.dspRmsFull);
+  }
+
+  // Calibration measurement (started from the web UI)
+  if (g_rssiCal.running) {
+    g_rssiCal.sumRaw += rssiRaw;
+    g_rssiCal.sumRms += noiseRms;
+    g_rssiCal.frames = g_rssiCal.frames + 1;
+    if (g_rssiCal.frames >= RSSI_CAL_FRAMES) {
+      g_rssiCal.avgRaw = (uint16_t)(g_rssiCal.sumRaw / RSSI_CAL_FRAMES);
+      g_rssiCal.avgRms = g_rssiCal.sumRms / RSSI_CAL_FRAMES;
+      g_rssiCal.running = false;
+    }
+  }
+
+  for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
+    int16_t a = absPeak(pcm[i]);
+    if (a > encPeak)
+      encPeak = a;
+  }
+  if (++peakFrames >= 50) { // publish once per second
+    g_status.adcPeak = adcPeak;
+    g_status.encPeak = encPeak;
+    adcPeak = 0;
+    encPeak = 0;
+    peakFrames = 0;
+  }
+
+  dsp.encodeULaw(pcm, frame.ulaw, AUDIO_FRAME_SAMPLES);
+
+  // Squelch. RSSI 0 means squelched (no audio), so an open squelch always
+  // sends at least 1.
+  const uint8_t openRSSI = baseRSSI ? baseRSSI : 1;
+  uint8_t finalRSSI = openRSSI;
+  bool active = true;
+  switch (cfg.data.cosMode) {
+  case COS_MODE_HARDWARE:
+    active = cosInputActive();
+    finalRSSI = active ? openRSSI : 0;
+    break;
+  case COS_MODE_DSP: {
+    // Average the last 3 frames (60 ms) to cut chatter near the threshold
+    static float rmsHist[3] = {0, 0, 0};
+    static uint8_t rmsIdx = 0;
+    static uint8_t noiseHist[3] = {0, 0, 0};
+    static bool sqlOpen = false;
+    rmsHist[rmsIdx] = noiseRms;
+    noiseHist[rmsIdx] = dsp.getNoiseLevel();
+    rmsIdx = (rmsIdx + 1) % 3;
+    int hyst = cfg.data.dspSqlHyst;
+
+    if (cfg.data.dspRmsNoSig > 0.0f && cfg.data.dspRmsFull > 0.0f) {
+      float avgRms = (rmsHist[0] + rmsHist[1] + rmsHist[2]) / 3.0f;
+      int level = rssiFromCal(avgRms, cfg.data.dspRmsNoSig, cfg.data.dspRmsFull);
+      int open = cfg.data.dspSqlOpen;
+      if (!sqlOpen && level >= open)
+        sqlOpen = true;
+      else if (sqlOpen && level < open - hyst)
+        sqlOpen = false;
+    } else {
+      int noise = (noiseHist[0] + noiseHist[1] + noiseHist[2]) / 3;
+      int thresh = cfg.data.dspSquelchThresh;
+      if (!sqlOpen && noise < thresh)
+        sqlOpen = true;
+      else if (sqlOpen && noise >= thresh + hyst)
+        sqlOpen = false;
+    }
+    active = sqlOpen;
+    finalRSSI = active ? openRSSI : 0;
+    break;
+  }
+  default: // COS_MODE_ALWAYS_ON
+    break;
+  }
+
+  g_status.cos = active;
+  g_status.rssi = finalRSSI;
+  g_status.noise = dsp.getNoiseLevel();
+
+  if (!send) {
+    tailCount = 0; // not on the GPS grid - status only, nothing sent
+    return;
+  }
+
+  bool sending = (finalRSSI > 0);
+  if (sending) {
+    tailCount = TAIL_FRAMES;
+  }
+  // Master (host option SENDALWAYS): a frame every 20 ms, RSSI 0 + silence
+  // when squelched - the host's timebase comes from this stream.
+  bool sendAlways = voter.sendAlways();
+  if (sending || tailCount > 0 || sendAlways) {
+    if (!sending) {
+      finalRSSI = 0; // Tail frame clears the server decoder
+      if (tailCount > 0)
+        tailCount--;
+      else
+        memset(frame.ulaw, 0xFF, sizeof(frame.ulaw)); // uLaw silence
+    }
+    frame.rssi = finalRSSI;
+    frame.time = slot;
+    if (xQueueSend(s_frameQueue, &frame, 0) == pdTRUE) {
+      g_status.framesQueued = g_status.framesQueued + 1;
+    } else {
+      g_status.framesDropped = g_status.framesDropped + 1;
+    }
+  }
+}
+
+// Capture -> GPS timebase. Read in 1 ms blocks so a GPS frame is made as soon
+// as its slot is captured. Until the audio clock is locked, 20 ms frames are
+// processed for status (and the offline repeater) only; nothing goes out.
+static void rxTask(void *arg) {
+  static int16_t chunk[AUDIO_DMA_SAMPLES];
+  static int16_t raw[AUDIO_FRAME_SAMPLES];
+  static int16_t grid[AUDIO_FRAME_SAMPLES];
+  static const VTIME noTime = {0, 0};
+  int rawFill = 0;
 
   for (;;) {
-    int64_t readUs;
-    if (!codecIo.readFrame(pcm, &readUs)) {
+    uint64_t start;
+    if (!codecIo.readSamples(chunk, AUDIO_DMA_SAMPLES, &start)) {
       g_status.readErrors = g_status.readErrors + 1;
       continue;
     }
+    gpsAudio.pushInput(chunk, AUDIO_DMA_SAMPLES, start);
 
-    portENTER_CRITICAL(&s_audioMux);
-    s_sampleCount += AUDIO_FRAME_SAMPLES;
-    s_lastReadUs = readUs;
-    portEXIT_CRITICAL(&s_audioMux);
-    g_status.framesCaptured = g_status.framesCaptured + 1;
-
-    for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
-      int16_t a = absPeak(pcm[i]);
-      if (a > adcPeak)
-        adcPeak = a;
+    bool locked = gpsAudio.locked();
+    if (locked) {
+      VTIME slot;
+      while (gpsAudio.popFrame(grid, &slot))
+        processFrame(grid, true, slot);
     }
 
-    // Raw copy for the offline repeater (it filters its own audio)
-    static int16_t raw[AUDIO_FRAME_SAMPLES];
-    if (rpt.active())
-      memcpy(raw, pcm, sizeof(raw));
-
-    // The host can ask for flat audio / no PL filter (voter.conf nodeemp,
-    // hostdeemp, noplfilter) - its request wins over the local setting
-    uint8_t baseRSSI = dsp.process(pcm, cfg.data.enablePLFilter && !voter.hostNoPlFilter(),
-                                   cfg.data.enableDeemp && !voter.hostFlatAudio());
-
-    uint16_t rssiRaw = readRssiRaw();
-    float noiseRms = dsp.getNoiseRms();
-    g_status.rssiRaw = rssiRaw;
-    g_status.noiseRms = noiseRms;
-
-    // RSSI 0-255, the same scale as the VOTER boards (chan_voter compares the
-    // raw byte). Uncalibrated DSP RSSI is already 10-255 from dsp.process().
-    if (cfg.data.useHwRSSI) {
-      // rssiMin = counts at no signal, rssiMax = counts at full quieting
-      baseRSSI = rssiFromCal(rssiRaw, cfg.data.rssiMin, cfg.data.rssiMax);
-    } else if (cfg.data.dspRmsNoSig > 0.0f && cfg.data.dspRmsFull > 0.0f) {
-      baseRSSI = rssiFromCal(noiseRms, cfg.data.dspRmsNoSig, cfg.data.dspRmsFull);
-    }
-
-    // Calibration measurement (started from the web UI)
-    if (g_rssiCal.running) {
-      g_rssiCal.sumRaw += rssiRaw;
-      g_rssiCal.sumRms += noiseRms;
-      g_rssiCal.frames = g_rssiCal.frames + 1;
-      if (g_rssiCal.frames >= RSSI_CAL_FRAMES) {
-        g_rssiCal.avgRaw = (uint16_t)(g_rssiCal.sumRaw / RSSI_CAL_FRAMES);
-        g_rssiCal.avgRms = g_rssiCal.sumRms / RSSI_CAL_FRAMES;
-        g_rssiCal.running = false;
+    memcpy(raw + rawFill, chunk, sizeof(chunk));
+    rawFill += AUDIO_DMA_SAMPLES;
+    if (rawFill >= AUDIO_FRAME_SAMPLES) {
+      rawFill = 0;
+      g_status.framesCaptured = g_status.framesCaptured + 1;
+      rpt.feedRx(raw, g_status.cos); // offline repeater: raw audio, last squelch state
+      if (!locked) {
+        memcpy(grid, raw, sizeof(grid));
+        processFrame(grid, false, noTime);
       }
     }
+  }
+}
 
-    for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
-      int16_t a = absPeak(pcm[i]);
-      if (a > encPeak)
-        encPeak = a;
-    }
-    if (++peakFrames >= 50) { // publish once per second
-      g_status.adcPeak = adcPeak;
-      g_status.encPeak = encPeak;
-      adcPeak = 0;
-      encPeak = 0;
-      peakFrames = 0;
-    }
+// -----------------------------------------------------------------------------
+// Network send: frames go out as soon as they are made (not via the main loop)
+// -----------------------------------------------------------------------------
+static void netTask(void *arg) {
+  AudioFrame f;
+  double sum = 0.0, mx = 0.0;
+  int n = 0;
+  uint32_t winStart = millis();
+  for (;;) {
+    if (xQueueReceive(s_frameQueue, &f, portMAX_DELAY) != pdTRUE)
+      continue;
+    voter.processAudioFrame(f.ulaw, f.rssi, f.time);
 
-    dsp.encodeULaw(pcm, frame.ulaw, AUDIO_FRAME_SAMPLES);
-
-    // Squelch. RSSI 0 means squelched (no audio), so an open squelch always
-    // sends at least 1.
-    const uint8_t openRSSI = baseRSSI ? baseRSSI : 1;
-    uint8_t finalRSSI = openRSSI;
-    bool active = true;
-    switch (cfg.data.cosMode) {
-    case COS_MODE_HARDWARE:
-      active = cosInputActive();
-      finalRSSI = active ? openRSSI : 0;
-      break;
-    case COS_MODE_DSP: {
-      // Average the last 3 frames (60 ms) to cut chatter near the threshold
-      static float rmsHist[3] = {0, 0, 0};
-      static uint8_t rmsIdx = 0;
-      static uint8_t noiseHist[3] = {0, 0, 0};
-      static bool sqlOpen = false;
-      rmsHist[rmsIdx] = noiseRms;
-      noiseHist[rmsIdx] = dsp.getNoiseLevel();
-      rmsIdx = (rmsIdx + 1) % 3;
-      int hyst = cfg.data.dspSqlHyst;
-
-      if (cfg.data.dspRmsNoSig > 0.0f && cfg.data.dspRmsFull > 0.0f) {
-        float avgRms = (rmsHist[0] + rmsHist[1] + rmsHist[2]) / 3.0f;
-        int level = rssiFromCal(avgRms, cfg.data.dspRmsNoSig, cfg.data.dspRmsFull);
-        int open = cfg.data.dspSqlOpen;
-        if (!sqlOpen && level >= open)
-          sqlOpen = true;
-        else if (sqlOpen && level < open - hyst)
-          sqlOpen = false;
-      } else {
-        int noise = (noiseHist[0] + noiseHist[1] + noiseHist[2]) / 3;
-        int thresh = cfg.data.dspSquelchThresh;
-        if (!sqlOpen && noise < thresh)
-          sqlOpen = true;
-        else if (sqlOpen && noise >= thresh + hyst)
-          sqlOpen = false;
-      }
-      active = sqlOpen;
-      finalRSSI = active ? openRSSI : 0;
-      break;
-    }
-    default: // COS_MODE_ALWAYS_ON
-      break;
-    }
-
-    g_status.cos = active;
-    rpt.feedRx(raw, active);
-    g_status.rssi = finalRSSI;
-    g_status.noise = dsp.getNoiseLevel();
-
-    bool sending = (finalRSSI > 0);
-    if (sending) {
-      tailCount = TAIL_FRAMES;
-    }
-    // Master (host option SENDALWAYS): a frame every 20 ms, RSSI 0 + silence
-    // when squelched - the host's timebase comes from this stream.
-    bool sendAlways = voter.sendAlways();
-    if (sending || tailCount > 0 || sendAlways) {
-      if (!sending) {
-        finalRSSI = 0; // Tail frame clears the server decoder
-        if (tailCount > 0)
-          tailCount--;
-        else
-          memset(frame.ulaw, 0xFF, sizeof(frame.ulaw)); // uLaw silence
-      }
-      frame.rssi = finalRSSI;
-      frame.time = {0, 0};
-      if (gps.isTimeSet()) {
-        gps.getNetworkTime(&frame.time, true);
-      }
-      if (xQueueSend(s_frameQueue, &frame, 0) == pdTRUE) {
-        g_status.framesQueued = g_status.framesQueued + 1;
-      } else {
-        g_status.framesDropped = g_status.framesDropped + 1;
-      }
+    // Age at send = GPS now - frame start. For a master this is part of every
+    // site's TX timing, so it is measured, not assumed.
+    VTIME now;
+    gps.getNetworkTime(&now, false);
+    double age = (double)(int32_t)(now.vtime_sec - f.time.vtime_sec) * 1000.0 +
+                 ((double)now.vtime_nsec - (double)f.time.vtime_nsec) / 1e6;
+    sum += age;
+    if (age > mx)
+      mx = age;
+    n++;
+    if (millis() - winStart >= 1000) {
+      g_status.sendAgeAvgMs = (float)(sum / n);
+      g_status.sendAgeMaxMs = (float)mx;
+      sum = mx = 0.0;
+      n = 0;
+      winStart = millis();
     }
   }
 }
@@ -308,44 +362,6 @@ static void updatePtt() {
   if (active != g_status.ptt) {
     g_status.ptt = active;
     Serial.printf("[PTT] %s\r\n", active ? "KEYED" : "released");
-  }
-}
-
-// -----------------------------------------------------------------------------
-// Sample clock vs GPS PPS (report only)
-// -----------------------------------------------------------------------------
-static void measureSampleClock(int64_t ppsUs) {
-  static bool haveRef = false;
-  static double refSamples = 0;
-  static int64_t refPpsUs = 0;
-
-  if (!gps.isLocked() || !g_status.audioOk) {
-    haveRef = false;
-    return;
-  }
-
-  portENTER_CRITICAL(&s_audioMux);
-  uint64_t sc = s_sampleCount;
-  int64_t lastRead = s_lastReadUs;
-  portEXIT_CRITICAL(&s_audioMux);
-
-  // Samples completed at the PPS edge (interpolated from the last DMA read)
-  double samplesAtPps = (double)sc + (double)(ppsUs - lastRead) * (AUDIO_SAMPLE_RATE / 1e6);
-
-  if (!haveRef) {
-    haveRef = true;
-    refSamples = samplesAtPps;
-    refPpsUs = ppsUs;
-    return;
-  }
-
-  int64_t secs = (ppsUs - refPpsUs + 500000) / 1000000;
-  if (secs >= 60) {
-    double expected = (double)secs * AUDIO_SAMPLE_RATE;
-    g_status.clockPpm = (float)((samplesAtPps - refSamples - expected) / expected * 1e6);
-    g_status.clockPpmValid = true;
-    refSamples = samplesAtPps;
-    refPpsUs = ppsUs;
   }
 }
 
@@ -451,9 +467,12 @@ static void printStatus() {
   Serial.printf(" TX      : PTT %s, jitter buffer %u bytes%s\r\n", g_status.ptt ? "KEYED" : "off",
                 (unsigned)voter.jitterBuffer.available(),
                 voter.jitterBuffer.isBuffering() ? " (buffering)" : "");
-  if (g_status.clockPpmValid) {
-    Serial.printf(" Clock   : %.2f ppm vs GPS\r\n", (double)g_status.clockPpm);
-  }
+  Serial.printf(" Clock   : audio %s, %.2f ppm vs GPS, PPS phase err %.1f us, resyncs %lu, resets %lu\r\n",
+                GpsAudio::stateStr(gpsAudio.state()), (double)gpsAudio.ppm(),
+                (double)gpsAudio.phaseErrUs(), (unsigned long)gpsAudio.resyncs(),
+                (unsigned long)gpsAudio.resets());
+  Serial.printf(" Send age: avg %.1f ms, max %.1f ms (GPS now - frame start)\r\n",
+                (double)g_status.sendAgeAvgMs, (double)g_status.sendAgeMaxMs);
   Serial.printf(" Heap    : %lu free\r\n", (unsigned long)ESP.getFreeHeap());
   Serial.println("----------------------------------------");
 }
@@ -562,10 +581,15 @@ void setup() {
 
   // Audio tasks
   s_frameQueue = xQueueCreate(FRAME_QUEUE_DEPTH, sizeof(AudioFrame));
+  gpsAudio.begin(AUDIO_SAMPLE_RATE);
+  // Connect / send only once the audio clock is locked to GPS as well
+  voter.setReadyCheck([]() { return gpsAudio.locked(); },
+                      []() { return GpsAudio::stateStr(gpsAudio.state()); });
   rpt.begin();
   if (g_status.audioOk) {
-    xTaskCreatePinnedToCore(rxTask, "rx", 4096, nullptr, 10, nullptr, 1);
+    xTaskCreatePinnedToCore(rxTask, "rx", 6144, nullptr, 10, nullptr, 1);
     xTaskCreatePinnedToCore(txTask, "tx", 4096, nullptr, 10, nullptr, 1);
+    xTaskCreatePinnedToCore(netTask, "net", 4096, nullptr, 9, nullptr, 1);
   } else {
     Serial.println("[Audio] ERROR: I2S failed to start - no audio in or out");
   }
@@ -595,9 +619,15 @@ void loop() {
   // 1. GPS
   gps.update();
   int64_t ppsUs;
-  if (gps.checkPPS(&ppsUs)) {
-    measureSampleClock(ppsUs);
+  if (gps.checkPPS(&ppsUs) && gps.isTimeSet() && g_status.audioOk) {
+    uint64_t dmaCount;
+    int64_t dmaUs;
+    codecIo.dmaSnapshot(&dmaCount, &dmaUs);
+    gpsAudio.onPps(ppsUs, gps.getEpoch(), dmaCount, dmaUs);
   }
+  gpsAudio.tick(millis());
+  g_status.clockPpm = gpsAudio.ppm();
+  g_status.clockPpmValid = gpsAudio.state() != GpsAudio::NO_PPS;
 
   // 2. Network
   net.update();
@@ -612,11 +642,7 @@ void loop() {
   wasUp = up;
 
   // 3. Voter protocol + queued audio frames, PTT
-  voter.update();
-  AudioFrame frame;
-  while (xQueueReceive(s_frameQueue, &frame, 0) == pdTRUE) {
-    voter.processAudioFrame(frame.ulaw, frame.rssi, frame.time);
-  }
+  voter.update(); // audio frames are sent by netTask
   rpt.update(voter.isConnected(), g_status.cos);
   updatePtt();
   updateLeds();

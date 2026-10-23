@@ -5,6 +5,8 @@
 #include "JitterBuffer.h"
 #include "VoterProtocol.h"
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <WiFiUdp.h>
 
 enum VoterState {
@@ -31,9 +33,17 @@ public:
              uint16_t localPort);
   void setHost(IPAddress host, uint16_t port);
 
-  void update();
+  void update(); // loop task
 
-  // Builds and sends one audio packet. frameTime = GPS time at frame capture.
+  // Extra condition (besides GPS lock) for connecting and sending, e.g. the
+  // audio clock being locked to GPS; notReady gives the reason for status.
+  void setReadyCheck(bool (*ready)(), const char *(*notReady)()) {
+    _readyFn = ready;
+    _notReadyFn = notReady;
+  }
+
+  // Builds and sends one audio packet. frameTime = GPS time of the frame's
+  // first sample. Safe to call from the network send task.
   void processAudioFrame(const uint8_t *ulawData, uint8_t rssi, VTIME frameTime);
 
   bool isConnected() { return _state == VOTER_CONNECTED; }
@@ -49,7 +59,17 @@ public:
   bool hostNoPlFilter() const { return _optionFlags & OPT_NOCTCSS; }
   VoterState getState() { return _state; }
   VoterAuthError getAuthError() { return _authError; }
-  void setTimingOffset(int16_t ms) { _timingOffsetMs = ms; }
+  // Packet stamp = frame GPS time + base offset + trim. The base matches the
+  // PIC VOTER timeline (measured against PIC boards via chan_voter and PIC
+  // status 98): client -100 ms, master -120 ms (puts TX packets 20 ms old
+  // at PIC TX buffers, same as a PIC master). Picked by the host's
+  // SENDALWAYS flag.
+  static const int16_t CLIENT_OFFSET_MS = -100;
+  static const int16_t MASTER_OFFSET_MS = -120;
+  void setTimingOffset(int16_t ms) { _timingOffsetMs = ms; } // trim
+  int16_t timingOffsetMs() const {
+    return ((_optionFlags & OPT_SENDALWAYS) ? MASTER_OFFSET_MS : CLIENT_OFFSET_MS) + _timingOffsetMs;
+  }
   uint32_t getAudioFramesSent() { return _audioFramesSent; }
   IPAddress getHostIP() { return _hostIP; }
 
@@ -64,6 +84,11 @@ public:
 
 private:
   bool isConnectedConst() const { return _state == VOTER_CONNECTED; }
+  bool _timingReady();
+  void _update();
+  SemaphoreHandle_t _lock = nullptr; // update() (loop) vs processAudioFrame() (send task)
+  bool (*_readyFn)() = nullptr;
+  const char *(*_notReadyFn)() = nullptr;
   volatile uint8_t _optionFlags = 0; // read by the RX task
 
   GPSManager *_gps;
@@ -106,14 +131,10 @@ private:
   bool _hasWarnedGps;
   bool _hasWarnedGpsWaitConnect;
 
-  // Continuous frame counting (see TIMING_AUTHORITY.md)
+  // Audio send state. Frame times come from GpsAudio (exact GPS grid).
   bool _isTransmitting;
   int16_t _timingOffsetMs;
   uint32_t _lastCallTime;
-  uint32_t _anchorSec;
-  uint32_t _anchorNsec;
-  uint32_t _burstPacketCount;
-  bool _anchorActive;
   uint32_t _gpSeq; // +1 per non-audio packet
 };
 

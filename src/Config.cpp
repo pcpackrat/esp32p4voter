@@ -33,6 +33,11 @@ void ConfigManager::begin() {
         // RSSI scale went from 0-127 to 0-255
         data.dspSqlOpen = (data.dspSqlOpen > 127) ? 255 : data.dspSqlOpen * 2;
       }
+      if (oldVersion < 7) {
+        // v6: frames stamped with exact GPS time. v7: client/master offsets
+        // are built in; the stored value is now only a trim on top of them.
+        data.timingOffsetMs = DEF_TIMING_OFFSET_MS;
+      }
       save();
       ok = true;
       Serial.printf("[Config] Migrated v%lu config from NVS\r\n", (unsigned long)oldVersion);

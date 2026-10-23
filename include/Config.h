@@ -7,8 +7,9 @@
 #define CONFIG_MAGIC 0x50345654 // "P4VT"
 // v2: netIface. v3: DSP RSSI calibration. v4: DSP squelch level/hysteresis.
 // v5: RSSI scale 0-127 -> 0-255 (dspSqlOpen doubled on migration).
+// v6: GPS-locked audio timebase - Timing Offset is now a trim, reset to 0.
 // Older versions are migrated: new fields are only ever added at the end.
-#define CONFIG_VERSION 5
+#define CONFIG_VERSION 7
 
 // Network interface selection
 #define NET_IFACE_AUTO 0 // Ethernet when a cable is connected, otherwise WiFi
