@@ -105,6 +105,9 @@ private:
   uint32_t _navStatusMs;
   uint32_t _ubxTimeMs; // last valid NAV-TIMEUTC
   bool _ubxTimeSeen;
+  uint32_t _utcFlagMs; // last NAV-TIMEUTC of any kind
+  bool _utcValid;      // its validUTC flag (leap seconds known)
+  bool _utcFlagLogged;
 
   void _ubxByte(uint8_t c);
   void _ubxHandle();

@@ -68,7 +68,7 @@ uint8_t DSPProcessor::process(int16_t *samples, bool enablePLFilter, bool enable
   // ---------------------------------------------------------
   // Path B: Audio (main chain)
   // ---------------------------------------------------------
-  // 1. Voice filter (integer FIR 300-2400Hz, ported from Voter2)
+  // 1. PL filter: 290 Hz high-pass (removes CTCSS, keeps voice to 3.6 kHz)
   if (enablePLFilter) {
     for (int i = 0; i < DSP_BLOCK_SAMPLES; i++) {
       _voiceFilter.put(samples[i]);

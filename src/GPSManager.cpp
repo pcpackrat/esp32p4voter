@@ -83,6 +83,9 @@ GPSManager::GPSManager() {
   _navStatusMs = 0;
   _ubxTimeMs = 0;
   _ubxTimeSeen = false;
+  _utcFlagMs = 0;
+  _utcValid = false;
+  _utcFlagLogged = false;
   _instance = this;
 }
 
@@ -161,9 +164,13 @@ void GPSManager::update() {
     _gotByte = true;
   }
 
-  // 2. New NMEA time -> epoch (UBX NAV-TIMEUTC takes over when present)
+  // 2. New NMEA time -> epoch (UBX NAV-TIMEUTC takes over when present).
+  // If the receiver says UTC isn't valid yet (leap seconds not received - its
+  // NMEA time can be whole seconds off), NMEA time is not used either.
   bool ubxTimeRecent = _ubxTimeSeen && (millis() - _ubxTimeMs < 3000);
-  if (!ubxTimeRecent && _gpsParser.time.isUpdated() && _gpsParser.date.isUpdated()) {
+  bool utcFlagFresh = _utcFlagMs != 0 && (millis() - _utcFlagMs < 3000);
+  bool utcBlocked = utcFlagFresh && !_utcValid;
+  if (!ubxTimeRecent && !utcBlocked && _gpsParser.time.isUpdated() && _gpsParser.date.isUpdated()) {
     if (_gpsParser.location.isValid()) {
       int64_t days = daysFromCivil(_gpsParser.date.year(), _gpsParser.date.month(),
                                    _gpsParser.date.day());
@@ -389,6 +396,22 @@ void GPSManager::_ubxHandle() {
     // iTOW U4, tAcc U4, nano I4, year U2, month, day, hour, min, sec U1, valid X1
     bool navFresh = _navStatusMs != 0 && millis() - _navStatusMs < 3000;
     bool validUtc = (p[19] & 0x04) != 0;
+    _utcFlagMs = millis();
+    if (validUtc != _utcValid || !_utcFlagLogged) {
+      _utcFlagLogged = true;
+      if (validUtc)
+        logger.info("GPS", "UTC valid (leap seconds known)");
+      else
+        logger.warn("GPS", "UTC not valid yet - leap seconds unknown, time held until they arrive (up to ~12.5 min)");
+    }
+    _utcValid = validUtc;
+    if (!validUtc && _validTime) {
+      // Time may have been set from NMEA with the receiver's default leap
+      // seconds (whole seconds off) - drop it until UTC is valid
+      portENTER_CRITICAL(&s_gpsMux);
+      _validTime = false;
+      portEXIT_CRITICAL(&s_gpsMux);
+    }
     // gpsFixOk includes the time-only fix used in timing mode
     if (validUtc && navFresh && _tm.gpsFixOk) {
       int64_t days = daysFromCivil(rdU2(p + 12), p[14], p[15]);
@@ -426,9 +449,12 @@ static const char *fixStr(uint8_t fix) {
 
 void GPSManager::timingSummary(char *buf, size_t len) {
   TimingStatus t = getTimingStatus();
-  char fix[32] = "";
-  if (t.navFresh)
-    snprintf(fix, sizeof(fix), ", fix %s", fixStr(t.gpsFix));
+  char fix[72] = "";
+  if (t.navFresh) {
+    bool utcFresh = _utcFlagMs != 0 && millis() - _utcFlagMs < 3000;
+    snprintf(fix, sizeof(fix), ", fix %s%s", fixStr(t.gpsFix),
+             !utcFresh ? "" : (_utcValid ? ", UTC valid" : ", UTC NOT valid (leap seconds unknown)"));
+  }
 
   if (cfg.gpsTm.mode == GPS_TMODE_OFF && (!t.answered || t.moduleMode == GPS_TMODE_OFF)) {
     snprintf(buf, len, "Off%s", fix);

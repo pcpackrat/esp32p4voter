@@ -74,7 +74,7 @@
 #define DEF_COS_INVERT false        // false = COS active low
 #define DEF_DSP_SQUELCH_THRESH 30   // uncalibrated DSP squelch, noise 0-255
 #define DEF_DSP_CALIB 50.0f         // uncalibrated DSP RSSI scale
-#define DEF_DSP_SQL_OPEN 40         // calibrated DSP squelch, RSSI 0-127
+#define DEF_DSP_SQL_OPEN 80         // calibrated DSP squelch, RSSI 0-255
 #define DEF_DSP_SQL_HYST 8
 #define DEF_USE_HW_RSSI false
 #define DEF_RSSI_MIN 200            // raw counts at no signal
@@ -86,9 +86,26 @@
 
 // --- Radio TX ---
 #define DEF_TX_GAIN_PCT 100
-#define DEF_PTT_INVERT false        // false = GPIO high keys the radio
+#define DEF_PTT_INVERT true         // true = GPIO low keys the radio, false = GPIO high keys
 #define DEF_PTT_TAIL_MS 500
 #define DEF_JITTER_MS 200
+
+// --- Offline repeater (failover when the host is not connected) ---
+#ifndef DEF_RPT_ID_CALL
+#define DEF_RPT_ID_CALL "" // CW ID callsign, e.g. "W5ABC/R" - required to transmit
+#endif
+#define DEF_RPT_ENABLE false
+#define DEF_RPT_TRIGGER_S 30        // not connected this long -> offline repeater
+#define DEF_RPT_HANG_MS 1000
+#define DEF_RPT_TOT_S 180           // timeout timer, 0 = off
+#define DEF_RPT_GAIN_PCT 100
+#define DEF_RPT_DEEMP false         // flat in -> flat out
+#define DEF_RPT_COURTESY true
+#define DEF_RPT_BEEP_HZ 880         // courtesy tone
+#define DEF_RPT_BEEP_MS 120
+#define DEF_RPT_ID_WPM 20
+#define DEF_RPT_ID_FREQ_HZ 800
+#define DEF_RPT_ID_LEVEL_PCT 15     // about -16 dBFS
 
 // --- GPS timing mode (LEA-5T) ---
 #define DEF_GPS_TMODE GPS_TMODE_OFF

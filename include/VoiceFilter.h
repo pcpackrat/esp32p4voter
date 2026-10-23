@@ -3,22 +3,23 @@
 
 #include <stdint.h>
 
-#define VOICEFILTER_TAP_NUM 65
+// CTCSS (PL) removal: 8th-order elliptic high-pass, 290 Hz @ 8 kHz.
+// >= 45 dB down from 67 to 270 Hz, flat within 0.5 dB from 290 Hz to 3.6 kHz.
+// High-pass only, like the analog PL filter on the PIC VOTER board - the old
+// Voter2 FIR (400-2400 Hz bandpass) also cut everything above 2.5 kHz.
+#define VOICEFILTER_SECTIONS 4
 
 class VoiceFilter {
 public:
   VoiceFilter();
   void init();
-  void put(int16_t input);
-  int16_t get();
+  void put(int16_t input); // filter one sample
+  int16_t get();           // result of the last put()
 
 private:
-  // The Voter2 reference implementation this filter is ported from used a
-  // 64-element history buffer (& 63 mask) with 65 filter taps - one more
-  // tap than the buffer could actually hold. 128 (& 127) has real headroom
-  // instead of relying on however that off-by-one happened to behave.
-  int16_t safe_history[128];
-  unsigned int last_index;
+  float _z1[VOICEFILTER_SECTIONS]; // transposed direct form II state
+  float _z2[VOICEFILTER_SECTIONS];
+  int16_t _out;
 };
 
 #endif // VOICEFILTER_H

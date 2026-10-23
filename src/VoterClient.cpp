@@ -115,6 +115,27 @@ const char *VoterClient::stateStr(VoterState s) {
   return "UNKNOWN";
 }
 
+void VoterClient::statusText(char *buf, size_t len) {
+  if (_state == VOTER_CONNECTED) {
+    uint8_t f = _optionFlags;
+    snprintf(buf, len, "CONNECTED%s%s%s", (f & OPT_SENDALWAYS) ? " (master)" : "",
+             (f & OPT_FLATAUDIO) ? " [host: flat audio]" : "", (f & OPT_NOCTCSS) ? " [host: no PL filter]" : "");
+  } else if (_state == VOTER_AUTH_ERROR) {
+    const char *why = _authError == AUTH_ERR_NO_RESPONSE      ? "no response from host - check address/port/network"
+                      : _authError == AUTH_ERR_HOST_MISMATCH  ? "host password mismatch"
+                      : _authError == AUTH_ERR_CLIENT_REJECTED ? "client password rejected by host"
+                                                               : "authentication failed";
+    snprintf(buf, len, "AUTH_ERROR - %s (reboot to retry)", why);
+  } else if (_gps && !_gps->isLocked()) {
+    // The client only connects with GPS lock
+    snprintf(buf, len, "WAITING FOR GPS (%s)", GPSManager::statusStr(_gps->getLockStatus()));
+  } else if (_state == VOTER_AUTHENTICATING) {
+    snprintf(buf, len, "AUTHENTICATING");
+  } else {
+    snprintf(buf, len, "CONNECTING");
+  }
+}
+
 void VoterClient::_send(const uint8_t *data, size_t len) {
   if (!_started || _hostIP == IPAddress(0, 0, 0, 0))
     return;
@@ -328,6 +349,20 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
     _authMismatchStreak = 0;
     _hasWarnedAuth = false;
 
+    // Host option flags ride in the byte after the header of its auth packets
+    // (same as the PIC firmware; 0 when absent)
+    if (type == PAYLOAD_AUTH) {
+      uint8_t flags = (len > (int)sizeof(VOTER_PACKET_HEADER)) ? data[sizeof(VOTER_PACKET_HEADER)] : 0;
+      if (flags != _optionFlags) {
+        logger.info("VOTER", "Host options 0x%02X:%s%s%s%s", flags,
+                    (flags & OPT_SENDALWAYS) ? " master(send always)" : "",
+                    (flags & OPT_MASTERTIMING) ? " master-timing" : "",
+                    (flags & OPT_FLATAUDIO) ? " flat-audio(no de-emphasis)" : "",
+                    (flags & OPT_NOCTCSS) ? " no-PL-filter" : "");
+        _optionFlags = flags;
+      }
+    }
+
     if (_state == VOTER_DISCONNECTED) {
       Serial.printf("[Voter] Host Password Accepted (Exp: 0x%08lX Got: 0x%08lX)\r\n",
                     (unsigned long)_serverDigest, (unsigned long)incomingDigest);
@@ -383,8 +418,20 @@ void VoterClient::processAudioFrame(const uint8_t *ulawData, uint8_t rssi, VTIME
   PROXY_AUDIO_PACKET pkt;
   memset(&pkt, 0, sizeof(pkt));
 
-  // Rule 1: Anchor once at the start of a transmission
-  if (!_anchorActive || !_isTransmitting) {
+  // Rule 1: Anchor at the start of a run of consecutive frames (a
+  // transmission, or the continuous stream when master), then count frames.
+  // Re-anchor if the count drifts a frame from GPS - the codec clock is not
+  // locked to GPS (~-24 ppm: one correction every ~14 min).
+  uint64_t frameNs = (uint64_t)frameTime.vtime_sec * 1000000000ULL + frameTime.vtime_nsec;
+  bool continuing = _anchorActive && (millis() - _lastCallTime < 100);
+  if (continuing) {
+    uint64_t expected = (uint64_t)_anchorSec * 1000000000ULL + _anchorNsec +
+                        (uint64_t)_burstPacketCount * 20000000ULL;
+    int64_t err = (int64_t)(frameNs - expected);
+    if (err > 15000000LL || err < -15000000LL)
+      continuing = false;
+  }
+  if (!continuing) {
     _anchorSec = frameTime.vtime_sec;
     _anchorNsec = frameTime.vtime_nsec;
     _burstPacketCount = 0;
@@ -405,9 +452,6 @@ void VoterClient::processAudioFrame(const uint8_t *ulawData, uint8_t rssi, VTIME
   _burstPacketCount++;
   _lastCallTime = millis();
   _isTransmitting = (rssi > 0);
-  if (!_isTransmitting) {
-    _anchorActive = false; // Unkeyed - next keyup re-anchors
-  }
 
   pkt.header.curtime.vtime_sec = my_htonl(pkt.header.curtime.vtime_sec);
   pkt.header.curtime.vtime_nsec = my_htonl(pkt.header.curtime.vtime_nsec);

@@ -47,7 +47,7 @@ struct RssiCalMeasure {
 };
 extern RssiCalMeasure g_rssiCal;
 
-// Map v to RSSI 0-127, linear between the no-signal and full-quieting
+// Map v to RSSI 0-255, linear between the no-signal and full-quieting
 // readings. Works either way round (RSSI voltage or noise falling with signal).
 uint8_t rssiFromCal(float v, float atNoSig, float atFull);
 extern GPSManager gps;

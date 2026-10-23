@@ -6,8 +6,9 @@
 
 #define CONFIG_MAGIC 0x50345654 // "P4VT"
 // v2: netIface. v3: DSP RSSI calibration. v4: DSP squelch level/hysteresis.
+// v5: RSSI scale 0-127 -> 0-255 (dspSqlOpen doubled on migration).
 // Older versions are migrated: new fields are only ever added at the end.
-#define CONFIG_VERSION 4
+#define CONFIG_VERSION 5
 
 // Network interface selection
 #define NET_IFACE_AUTO 0 // Ethernet when a cable is connected, otherwise WiFi
@@ -41,7 +42,7 @@ struct SysConfig {
   float dspCalib;
   bool useHwRSSI;    // RSSI from the GPIO20 ADC instead of DSP noise
   uint16_t rssiMin;  // Raw ADC counts (0-4095) mapped to RSSI 0
-  uint16_t rssiMax;  // Raw ADC counts mapped to RSSI 127
+  uint16_t rssiMax;  // Raw ADC counts mapped to RSSI 255
   uint8_t rxPgaGain; // ES8311 analog gain step (0-10)
   uint8_t rxDigitalGainPct;
   bool enablePLFilter;
@@ -76,7 +77,7 @@ struct SysConfig {
   float dspRmsNoSig;
   float dspRmsFull;
 
-  // DSP squelch (v4). Calibrated: opens at DSP RSSI >= dspSqlOpen (0-127).
+  // DSP squelch (v4). Calibrated: opens at DSP RSSI >= dspSqlOpen (0-255 since v5).
   // Uncalibrated: opens at noise < dspSquelchThresh. Either way it closes
   // dspSqlHyst units past the opening point.
   uint8_t dspSqlOpen;
@@ -97,20 +98,43 @@ struct GpsTimingConfig {
   uint32_t fixedAccMm;            // Fixed position accuracy (1 sigma)
 };
 
+// Offline repeater (failover when the voter host is not connected).
+// Stored under its own NVS key like GpsTimingConfig.
+struct RptConfig {
+  bool enable;
+  uint16_t triggerS;  // not connected this long -> offline repeater
+  uint16_t hangMs;    // PTT hang after COS drops
+  uint16_t totS;      // timeout timer, 0 = off
+  uint8_t gainPct;    // repeated audio level
+  bool deemp;         // de-emphasize repeated audio (TX input pre-emphasizes)
+  bool courtesy;      // courtesy beep after each transmission
+  char idCall[16];    // CW ID, required to transmit
+  uint8_t idWpm;
+  uint16_t idFreqHz;
+  uint8_t idLevelPct; // CW ID / courtesy tone level, % of full scale
+  // Added later - keep new fields at the end (older saved blocks are loaded
+  // as a prefix and the rest takes defaults)
+  uint16_t beepHz; // courtesy tone
+  uint16_t beepMs;
+};
+
 class ConfigManager {
 public:
   void begin();
   void save();
   void resetDefaults();
   void saveGpsTiming();
+  void saveRpt();
 
   IPAddress hostIP() const { return IPAddress(data.hostIP); }
 
   SysConfig data;
   GpsTimingConfig gpsTm;
+  RptConfig rpt;
 
 private:
   void _gpsTimingDefaults();
+  void _rptDefaults();
 };
 
 extern ConfigManager cfg;

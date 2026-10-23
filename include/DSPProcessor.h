@@ -14,7 +14,7 @@ public:
   void begin();
 
   // Process one 160-sample frame in place.
-  // enablePLFilter: 300-2400Hz voice bandpass (removes CTCSS)
+  // enablePLFilter: 290 Hz high-pass (removes CTCSS)
   // enableDeemp: single-pole de-emphasis
   // Returns DSP RSSI (10-255, higher = quieter noise floor = stronger signal)
   uint8_t process(int16_t *samples, bool enablePLFilter, bool enableDeemp);

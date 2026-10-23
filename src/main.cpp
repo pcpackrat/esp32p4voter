@@ -26,6 +26,7 @@
 #include "Logger.h"
 #include "NetManager.h"
 #include "Pins.h"
+#include "Repeater.h"
 #include "Version.h"
 #include "VoterClient.h"
 #include "WebUI.h"
@@ -81,7 +82,7 @@ uint8_t rssiFromCal(float v, float atNoSig, float atFull) {
     f = 0.0f;
   if (f > 1.0f)
     f = 1.0f;
-  return (uint8_t)(f * 127.0f + 0.5f);
+  return (uint8_t)(f * 255.0f + 0.5f);
 }
 
 // -----------------------------------------------------------------------------
@@ -114,21 +115,28 @@ static void rxTask(void *arg) {
         adcPeak = a;
     }
 
-    uint8_t baseRSSI = dsp.process(pcm, cfg.data.enablePLFilter, cfg.data.enableDeemp);
+    // Raw copy for the offline repeater (it filters its own audio)
+    static int16_t raw[AUDIO_FRAME_SAMPLES];
+    if (rpt.active())
+      memcpy(raw, pcm, sizeof(raw));
+
+    // The host can ask for flat audio / no PL filter (voter.conf nodeemp,
+    // hostdeemp, noplfilter) - its request wins over the local setting
+    uint8_t baseRSSI = dsp.process(pcm, cfg.data.enablePLFilter && !voter.hostNoPlFilter(),
+                                   cfg.data.enableDeemp && !voter.hostFlatAudio());
 
     uint16_t rssiRaw = readRssiRaw();
     float noiseRms = dsp.getNoiseRms();
     g_status.rssiRaw = rssiRaw;
     g_status.noiseRms = noiseRms;
 
-    // RSSI 0-127 (7-bit, per protocol)
+    // RSSI 0-255, the same scale as the VOTER boards (chan_voter compares the
+    // raw byte). Uncalibrated DSP RSSI is already 10-255 from dsp.process().
     if (cfg.data.useHwRSSI) {
       // rssiMin = counts at no signal, rssiMax = counts at full quieting
       baseRSSI = rssiFromCal(rssiRaw, cfg.data.rssiMin, cfg.data.rssiMax);
     } else if (cfg.data.dspRmsNoSig > 0.0f && cfg.data.dspRmsFull > 0.0f) {
       baseRSSI = rssiFromCal(noiseRms, cfg.data.dspRmsNoSig, cfg.data.dspRmsFull);
-    } else {
-      baseRSSI >>= 1; // uncalibrated DSP RSSI is 10-255 - halve it rather than wrap
     }
 
     // Calibration measurement (started from the web UI)
@@ -158,13 +166,15 @@ static void rxTask(void *arg) {
 
     dsp.encodeULaw(pcm, frame.ulaw, AUDIO_FRAME_SAMPLES);
 
-    // Squelch. Open squelch sets bit 7 and keeps the RSSI in bits 0-6.
-    uint8_t finalRSSI = baseRSSI;
+    // Squelch. RSSI 0 means squelched (no audio), so an open squelch always
+    // sends at least 1.
+    const uint8_t openRSSI = baseRSSI ? baseRSSI : 1;
+    uint8_t finalRSSI = openRSSI;
     bool active = true;
     switch (cfg.data.cosMode) {
     case COS_MODE_HARDWARE:
       active = cosInputActive();
-      finalRSSI = active ? ((baseRSSI & 0x7F) | 0x80) : 0;
+      finalRSSI = active ? openRSSI : 0;
       break;
     case COS_MODE_DSP: {
       // Average the last 3 frames (60 ms) to cut chatter near the threshold
@@ -194,7 +204,7 @@ static void rxTask(void *arg) {
           sqlOpen = false;
       }
       active = sqlOpen;
-      finalRSSI = active ? ((baseRSSI & 0x7F) | 0x80) : 0;
+      finalRSSI = active ? openRSSI : 0;
       break;
     }
     default: // COS_MODE_ALWAYS_ON
@@ -202,6 +212,7 @@ static void rxTask(void *arg) {
     }
 
     g_status.cos = active;
+    rpt.feedRx(raw, active);
     g_status.rssi = finalRSSI;
     g_status.noise = dsp.getNoiseLevel();
 
@@ -209,10 +220,16 @@ static void rxTask(void *arg) {
     if (sending) {
       tailCount = TAIL_FRAMES;
     }
-    if (sending || tailCount > 0) {
+    // Master (host option SENDALWAYS): a frame every 20 ms, RSSI 0 + silence
+    // when squelched - the host's timebase comes from this stream.
+    bool sendAlways = voter.sendAlways();
+    if (sending || tailCount > 0 || sendAlways) {
       if (!sending) {
         finalRSSI = 0; // Tail frame clears the server decoder
-        tailCount--;
+        if (tailCount > 0)
+          tailCount--;
+        else
+          memset(frame.ulaw, 0xFF, sizeof(frame.ulaw)); // uLaw silence
       }
       frame.rssi = finalRSSI;
       frame.time = {0, 0};
@@ -239,9 +256,13 @@ static void txTask(void *arg) {
   int peakFrames = 0;
 
   for (;;) {
-    // Returns 0 while buffering / empty; ulaw is filled with silence (0xFF)
-    size_t got = voter.jitterBuffer.get(ulaw, AUDIO_FRAME_SAMPLES);
-    dsp.decodeULaw(ulaw, pcm, AUDIO_FRAME_SAMPLES);
+    // Offline repeater owns the TX path while active; otherwise host audio.
+    // jitterBuffer.get() returns 0 while buffering / empty (ulaw = silence).
+    size_t got = 0;
+    if (!rpt.fillTx(pcm)) {
+      got = voter.jitterBuffer.get(ulaw, AUDIO_FRAME_SAMPLES);
+      dsp.decodeULaw(ulaw, pcm, AUDIO_FRAME_SAMPLES);
+    }
 
     if (gain != 1.0f) {
       for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
@@ -276,8 +297,13 @@ static void txTask(void *arg) {
 // PTT: keyed while host audio keeps arriving, plus a tail (as TeensyVoter)
 // -----------------------------------------------------------------------------
 static void updatePtt() {
-  uint32_t last = voter.getLastHostAudioTime();
-  bool active = (last != 0) && (millis() - last < cfg.data.pttTailMs);
+  bool active;
+  if (rpt.active()) {
+    active = rpt.keyed(); // offline repeater
+  } else {
+    uint32_t last = voter.getLastHostAudioTime();
+    active = (last != 0) && (millis() - last < cfg.data.pttTailMs);
+  }
   digitalWrite(PIN_PTT, (active != cfg.data.pttInvert) ? HIGH : LOW);
   if (active != g_status.ptt) {
     g_status.ptt = active;
@@ -386,8 +412,10 @@ static void printStatus() {
   Serial.println("----------------------------------------");
   Serial.printf(" %s v%s (%s)\r\n", FIRMWARE_NAME, FIRMWARE_VERSION, BUILD_DATE);
   Serial.printf(" Network : %s %s\r\n", net.modeStr(), net.localIP().toString().c_str());
+  char voterState[96];
+  voter.statusText(voterState, sizeof(voterState));
   Serial.printf(" Voter   : %s -> %s:%u, frames sent %lu, host frames %lu\r\n",
-                VoterClient::stateStr(voter.getState()), voter.getHostIP().toString().c_str(),
+                voterState, voter.getHostIP().toString().c_str(),
                 cfg.data.hostPort, (unsigned long)voter.getAudioFramesSent(),
                 (unsigned long)voter.getHostFramesReceived());
   Serial.printf(" GPS     : %s, sats %lu, PPS jitter %lu us\r\n",
@@ -402,9 +430,12 @@ static void printStatus() {
                   (unsigned long)gps.getNmeaBad(), (long)nmeaAge);
   }
   Serial.printf(" PPS     : %s\r\n", gps.isPpsActive() ? "OK (1 Hz)" : "none");
-  char timing[96];
+  char timing[160];
   gps.timingSummary(timing, sizeof(timing));
   Serial.printf(" Timing  : %s\r\n", timing);
+  char rptState[96];
+  rpt.stateStr(rptState, sizeof(rptState));
+  Serial.printf(" Repeater: %s\r\n", rptState);
   Serial.printf(" Codec   : %s, I2S %s\r\n", g_status.codecOk ? "OK" : "FAIL",
                 g_status.audioOk ? "OK" : "FAIL");
   Serial.printf(" RX      : COS %s, RSSI %u (%s), noise %u, RSSI pin %u counts\r\n",
@@ -531,6 +562,7 @@ void setup() {
 
   // Audio tasks
   s_frameQueue = xQueueCreate(FRAME_QUEUE_DEPTH, sizeof(AudioFrame));
+  rpt.begin();
   if (g_status.audioOk) {
     xTaskCreatePinnedToCore(rxTask, "rx", 4096, nullptr, 10, nullptr, 1);
     xTaskCreatePinnedToCore(txTask, "tx", 4096, nullptr, 10, nullptr, 1);
@@ -545,7 +577,9 @@ void setup() {
 static void updateLeds() {
   static int8_t last[4] = {-1, -1, -1, -1};
   const uint8_t pins[4] = {PIN_LED_COS, PIN_LED_PTT, PIN_LED_GPS, PIN_LED_HOST};
-  const bool on[4] = {g_status.cos, g_status.ptt, gps.isLocked(), voter.isConnected()};
+  // Host LED blinks (1 Hz) while the offline repeater is active
+  bool hostLed = voter.isConnected() || (rpt.active() && (millis() / 500) % 2 == 0);
+  const bool on[4] = {g_status.cos, g_status.ptt, gps.isLocked(), hostLed};
   for (int i = 0; i < 4; i++) {
     if (last[i] != (int8_t)on[i]) {
       digitalWrite(pins[i], on[i] ? HIGH : LOW);
@@ -583,6 +617,7 @@ void loop() {
   while (xQueueReceive(s_frameQueue, &frame, 0) == pdTRUE) {
     voter.processAudioFrame(frame.ulaw, frame.rssi, frame.time);
   }
+  rpt.update(voter.isConnected(), g_status.cos);
   updatePtt();
   updateLeds();
 

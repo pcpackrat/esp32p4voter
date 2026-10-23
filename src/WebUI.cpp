@@ -3,6 +3,7 @@
 #include "Config.h"
 #include "Logger.h"
 #include "NetManager.h"
+#include "Repeater.h"
 #include "Version.h"
 #include <ETH.h>
 #include <Update.h>
@@ -78,7 +79,7 @@ static String htmlHeader(const char *title) {
   html += "<script>function toggleShow(id){var e=document.getElementById(id);e.type=(e.type==='password')?'text':'password';}</script>";
   html += "</head><body><div class=\"container\">";
   html += "<h1>" FIRMWARE_NAME "</h1>";
-  html += "<div class=\"nav\"><a href=\"/\">Status</a><a href=\"/voter\">Voter</a><a href=\"/radio\">Radio</a><a href=\"/network\">Network</a><a href=\"/wifi\">WiFi</a><a href=\"/gps\">GPS</a><a href=\"/update\">Firmware</a></div>";
+  html += "<div class=\"nav\"><a href=\"/\">Status</a><a href=\"/voter\">Voter</a><a href=\"/radio\">Radio</a><a href=\"/network\">Network</a><a href=\"/wifi\">WiFi</a><a href=\"/gps\">GPS</a><a href=\"/repeater\">Repeater</a><a href=\"/update\">Firmware</a></div>";
   return html;
 }
 
@@ -106,6 +107,7 @@ static void handleRoot() {
           "<tr><td>State</td><td id=\"voter\">-</td></tr>"
           "<tr><td>Host</td><td id=\"host\">-</td></tr>"
           "<tr><td>Audio frames sent</td><td id=\"sent\">-</td></tr>"
+          "<tr><td>Offline repeater</td><td id=\"rpt\">-</td></tr>"
           "</table></div>";
   html += "<div class=\"card\"><h2>Receiver</h2><table>"
           "<tr><td>COS</td><td id=\"cos\">-</td></tr>"
@@ -151,7 +153,8 @@ static void handleRoot() {
           "e.innerHTML='<span class=\"status '+(ok?'ok':'warn')+'\">'+t+'</span>';}"
           "function db(v){return v<=-99?'none':v.toFixed(1)+' dB';}"
           "function poll(){fetch('/api/status').then(function(r){return r.json();}).then(function(s){"
-          "st('voter',s.voter,s.voter=='CONNECTED');st('host',s.host);st('sent',s.sent);"
+          "st('voter',s.voter,s.voter.indexOf('CONNECTED')==0);st('host',s.host);st('sent',s.sent);"
+          "if(s.rpt.indexOf('ACTIVE')==0)st('rpt',s.rpt,true);else st('rpt',s.rpt);"
           "st('cos',s.cos?'OPEN':'closed',s.cos);st('rssi',s.rssi+(s.hwrssi?' (hardware)':' (DSP)'));"
           "st('noise',s.noise);st('rssiraw',s.rssiraw);"
           "st('adcpk',db(s.adcpk)+' FS');st('encpk',db(s.encpk),s.encpk<-1);"
@@ -180,8 +183,12 @@ static float peakDb(int16_t peak, float ref) {
 static void handleApiStatus() {
   char lat[16] = "", lon[16] = "", elev[16] = "";
   gps.getGPSStrings(lat, lon, elev);
-  char timing[96];
+  char timing[160];
   gps.timingSummary(timing, sizeof(timing));
+  char rptState[96];
+  rpt.stateStr(rptState, sizeof(rptState));
+  char voterState[96];
+  voter.statusText(voterState, sizeof(voterState));
 
   char utc[24] = "-";
   if (gps.isTimeSet()) {
@@ -206,7 +213,7 @@ static void handleApiStatus() {
 
   char buf[1536];
   snprintf(buf, sizeof(buf),
-           "{\"voter\":\"%s\",\"host\":\"%s\",\"sent\":%lu,"
+           "{\"voter\":\"%s\",\"host\":\"%s\",\"sent\":%lu,\"rpt\":\"%s\","
            "\"cos\":%s,\"rssi\":%u,\"hwrssi\":%s,\"rssiraw\":%u,\"noise\":%u,\"adcpk\":%.1f,\"encpk\":%.1f,"
            "\"ppm\":%.2f,\"ppmok\":%s,\"cap\":%lu,\"drop\":%lu,\"rderr\":%lu,\"codec\":%s,"
            "\"ptt\":%s,\"hostfr\":%lu,\"played\":%lu,\"jb\":%u,\"jbbuf\":%s,\"txpk\":%.1f,\"wrerr\":%lu,"
@@ -214,8 +221,9 @@ static void handleApiStatus() {
            "\"nmea\":%lu,\"nmok\":%lu,\"nmbad\":%lu,\"nmage\":%ld,\"ppsok\":%s,\"tmode\":\"%s\","
            "\"lat\":\"%s\",\"lon\":\"%s\",\"elev\":\"%s\","
            "\"iface\":\"%s\",\"ip\":\"%s\",\"link\":\"%s\",\"up\":%lu,\"heap\":%lu}",
-           VoterClient::stateStr(voter.getState()), jsonEscape(host.c_str()).c_str(),
-           (unsigned long)voter.getAudioFramesSent(), g_status.cos ? "true" : "false",
+           jsonEscape(voterState).c_str(), jsonEscape(host.c_str()).c_str(),
+           (unsigned long)voter.getAudioFramesSent(), jsonEscape(rptState).c_str(),
+           g_status.cos ? "true" : "false",
            (unsigned)g_status.rssi, cfg.data.useHwRSSI ? "true" : "false",
            (unsigned)g_status.rssiRaw, (unsigned)g_status.noise, peakDb(g_status.adcPeak, 32768.0f),
            peakDb(g_status.encPeak, (float)ULAW_CLIP_LEVEL), (double)g_status.clockPpm,
@@ -299,7 +307,7 @@ static void handleRadio() {
   bool dspCal = cfg.data.dspRmsNoSig > 0.0f && cfg.data.dspRmsFull > 0.0f;
   html += String("<p>DSP squelch: ") +
           (dspCal ? "using the calibrated open level." : "DSP RSSI not calibrated - using the noise threshold.") + "</p>";
-  html += "<label>DSP Squelch Open Level (calibrated RSSI 0-127, opens at or above):</label><input type=\"number\" min=\"0\" max=\"127\" name=\"dspSqlOpen\" value=\"" + String(cfg.data.dspSqlOpen) + "\">";
+  html += "<label>DSP Squelch Open Level (calibrated RSSI 0-255, opens at or above):</label><input type=\"number\" min=\"0\" max=\"255\" name=\"dspSqlOpen\" value=\"" + String(cfg.data.dspSqlOpen) + "\">";
   html += "<label>DSP Squelch Threshold, uncalibrated only (0-255, noise level above this = closed):</label><input type=\"number\" min=\"0\" max=\"255\" name=\"dspSquelch\" value=\"" + String(cfg.data.dspSquelchThresh) + "\">";
   html += "<label>DSP Squelch Hysteresis (closes this many units past the opening point):</label><input type=\"number\" min=\"0\" max=\"60\" name=\"dspSqlHyst\" value=\"" + String(cfg.data.dspSqlHyst) + "\">";
   html += "<label>DSP RSSI Calibration (higher = more noise before RSSI drops):</label><input type=\"number\" step=\"0.1\" min=\"1\" max=\"1000\" name=\"dspCalib\" value=\"" + String(cfg.data.dspCalib, 1) + "\">";
@@ -323,7 +331,7 @@ static void handleRadio() {
   html += "</select>";
   html += "<label>Digital Gain (%):</label><input type=\"number\" min=\"0\" max=\"255\" name=\"rxDigitalGain\" value=\"" + String(cfg.data.rxDigitalGainPct) + "\">";
   html += checkbox("deemp", cfg.data.enableDeemp, "De-emphasis (use with flat/discriminator audio)");
-  html += checkbox("plFilter", cfg.data.enablePLFilter, "PL Filter (300-2400 Hz voice bandpass)");
+  html += checkbox("plFilter", cfg.data.enablePLFilter, "PL Filter (removes CTCSS tones below 290 Hz)");
 
   html += "<h2>Transmit</h2>";
   html += "<label>TX Gain (%, 100 = unity):</label><input type=\"number\" min=\"0\" max=\"255\" name=\"txGain\" value=\"" + String(cfg.data.txGainPct) + "\">";
@@ -339,7 +347,7 @@ static void handleRadioPost() {
   cfg.data.cosMode = (uint8_t)constrain(webServer.arg("cosMode").toInt(), 0, 2);
   cfg.data.cosInvert = webServer.hasArg("cosInvert");
   cfg.data.dspSquelchThresh = (uint8_t)constrain(webServer.arg("dspSquelch").toInt(), 0, 255);
-  cfg.data.dspSqlOpen = (uint8_t)constrain(webServer.arg("dspSqlOpen").toInt(), 0, 127);
+  cfg.data.dspSqlOpen = (uint8_t)constrain(webServer.arg("dspSqlOpen").toInt(), 0, 255);
   cfg.data.dspSqlHyst = (uint8_t)constrain(webServer.arg("dspSqlHyst").toInt(), 0, 60);
   float calib = webServer.arg("dspCalib").toFloat();
   cfg.data.dspCalib = (calib < 1.0f) ? 1.0f : calib;
@@ -638,6 +646,71 @@ static void handleRssiCalSave() {
 }
 
 // ---------------------------------------------------------------------------
+// Offline repeater
+// ---------------------------------------------------------------------------
+static void handleRepeater() {
+  const RptConfig &r = cfg.rpt;
+  String html = htmlHeader("Repeater");
+  if (webServer.hasArg("saved"))
+    html += "<div class=\"card\"><span class=\"status ok\">Saved - applied immediately</span></div>";
+  if (webServer.hasArg("nocall"))
+    html += "<div class=\"card\"><span class=\"status warn\">Not enabled: an ID callsign is required to transmit</span></div>";
+  char state[96];
+  rpt.stateStr(state, sizeof(state));
+  html += "<div class=\"card\"><h2>Offline Repeater</h2>";
+  html += "<p>When enabled, if this unit is not connected to the voter host for the time below (never "
+          "connects after boot, or drops off - this includes losing GPS lock), it becomes an offline "
+          "repeater: RX audio goes straight back out the TX, PTT follows COS. It hands back to the host "
+          "when the host reconnects, after the current transmission ends. Needs a full-duplex radio.</p>";
+  html += "<p>Now: <b>" + htmlEscape(state) + "</b></p>";
+  html += "<form method=\"POST\" action=\"/repeater\">";
+  html += checkbox("enable", r.enable, "Enable offline repeater failover");
+  html += "<label>Take over after the host is not connected for (s):</label><input type=\"number\" name=\"trigger\" min=\"5\" max=\"3600\" value=\"" + String(r.triggerS) + "\">";
+  html += "<label>Hang time after the input drops (ms):</label><input type=\"number\" name=\"hang\" min=\"0\" max=\"10000\" value=\"" + String(r.hangMs) + "\">";
+  html += "<label>Timeout timer (s, 0 = off):</label><input type=\"number\" name=\"tot\" min=\"0\" max=\"1800\" value=\"" + String(r.totS) + "\">";
+  html += "<label>Repeated audio level (%, 100 = unity):</label><input type=\"number\" name=\"gain\" min=\"0\" max=\"255\" value=\"" + String(r.gainPct) + "\">";
+  html += "<p>The overall TX level is still set by TX Gain on the Radio page. The PL Filter setting there also applies to repeated audio.</p>";
+  html += checkbox("deemp", r.deemp, "De-emphasize repeated audio (only if the TX audio input pre-emphasizes - flat in, flat out otherwise)");
+  html += checkbox("courtesy", r.courtesy, "Courtesy tone after each transmission");
+  html += "<label>Courtesy tone frequency (Hz):</label><input type=\"number\" name=\"beepHz\" min=\"300\" max=\"3000\" value=\"" + String(r.beepHz) + "\">";
+  html += "<label>Courtesy tone length (ms):</label><input type=\"number\" name=\"beepMs\" min=\"20\" max=\"1000\" value=\"" + String(r.beepMs) + "\">";
+  html += "<h2>CW ID</h2>";
+  html += "<p>Sent after the first transmission, then whenever there has been activity and 10 minutes have "
+          "passed since the last ID (FCC 97.119). Waits for a gap; sent over the audio if still pending after a minute.</p>";
+  html += "<label>ID callsign (required):</label><input type=\"text\" name=\"call\" maxlength=\"15\" value=\"" + htmlEscape(r.idCall) + "\">";
+  html += "<label>Speed (WPM):</label><input type=\"number\" name=\"wpm\" min=\"5\" max=\"40\" value=\"" + String(r.idWpm) + "\">";
+  html += "<label>Tone (Hz):</label><input type=\"number\" name=\"freq\" min=\"300\" max=\"2000\" value=\"" + String(r.idFreqHz) + "\">";
+  html += "<label>ID and courtesy tone level (% of full scale):</label><input type=\"number\" name=\"level\" min=\"1\" max=\"100\" value=\"" + String(r.idLevelPct) + "\">";
+  html += "<input type=\"submit\" value=\"Save\" class=\"btn\"></form></div>";
+  html += htmlFooter();
+  webServer.send(200, "text/html", html);
+}
+
+static void handleRepeaterPost() {
+  RptConfig &r = cfg.rpt;
+  String call = webServer.arg("call");
+  call.trim();
+  call.toUpperCase();
+  strlcpy(r.idCall, call.c_str(), sizeof(r.idCall));
+  bool wantEnable = webServer.hasArg("enable");
+  r.enable = wantEnable && r.idCall[0] != '\0';
+  r.triggerS = (uint16_t)constrain(webServer.arg("trigger").toInt(), 5, 3600);
+  r.hangMs = (uint16_t)constrain(webServer.arg("hang").toInt(), 0, 10000);
+  r.totS = (uint16_t)constrain(webServer.arg("tot").toInt(), 0, 1800);
+  r.gainPct = (uint8_t)constrain(webServer.arg("gain").toInt(), 0, 255);
+  r.deemp = webServer.hasArg("deemp");
+  r.courtesy = webServer.hasArg("courtesy");
+  r.beepHz = (uint16_t)constrain(webServer.arg("beepHz").toInt(), 300, 3000);
+  r.beepMs = (uint16_t)constrain(webServer.arg("beepMs").toInt(), 20, 1000);
+  r.idWpm = (uint8_t)constrain(webServer.arg("wpm").toInt(), 5, 40);
+  r.idFreqHz = (uint16_t)constrain(webServer.arg("freq").toInt(), 300, 2000);
+  r.idLevelPct = (uint8_t)constrain(webServer.arg("level").toInt(), 1, 100);
+  cfg.saveRpt();
+  webServer.sendHeader("Location", (wantEnable && !r.enable) ? "/repeater?nocall=1" : "/repeater?saved=1", true);
+  webServer.send(302, "text/plain", "");
+}
+
+// ---------------------------------------------------------------------------
 // GPS timing mode
 // ---------------------------------------------------------------------------
 static void handleGps() {
@@ -771,6 +844,8 @@ void webBegin() {
   webServer.on("/rssical/measure", HTTP_POST, handleRssiCalMeasure);
   webServer.on("/rssical/state", HTTP_GET, handleRssiCalState);
   webServer.on("/rssical/save", HTTP_POST, handleRssiCalSave);
+  webServer.on("/repeater", HTTP_GET, handleRepeater);
+  webServer.on("/repeater", HTTP_POST, handleRepeaterPost);
   webServer.on("/gps", HTTP_GET, handleGps);
   webServer.on("/gps", HTTP_POST, handleGpsPost);
   webServer.on("/update", HTTP_GET, handleUpdate);

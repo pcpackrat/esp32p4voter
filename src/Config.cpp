@@ -29,6 +29,9 @@ void ConfigManager::begin() {
       if (oldVersion < 4) {
         data.dspSqlOpen = DEF_DSP_SQL_OPEN;
         data.dspSqlHyst = DEF_DSP_SQL_HYST;
+      } else if (oldVersion < 5) {
+        // RSSI scale went from 0-127 to 0-255
+        data.dspSqlOpen = (data.dspSqlOpen > 127) ? 255 : data.dspSqlOpen * 2;
       }
       save();
       ok = true;
@@ -45,6 +48,36 @@ void ConfigManager::begin() {
   } else {
     _gpsTimingDefaults();
   }
+
+  // Defaults first, then whatever was saved on top (an older, shorter block
+  // leaves the newer fields at their defaults)
+  _rptDefaults();
+  size_t rptLen = prefs.getBytesLength("rpt");
+  if (rptLen > 0 && rptLen <= sizeof(rpt)) {
+    prefs.getBytes("rpt", &rpt, rptLen);
+  }
+}
+
+void ConfigManager::saveRpt() {
+  prefs.putBytes("rpt", &rpt, sizeof(rpt));
+  Serial.println("[Config] Repeater settings saved to NVS");
+}
+
+void ConfigManager::_rptDefaults() {
+  memset(&rpt, 0, sizeof(rpt));
+  rpt.enable = DEF_RPT_ENABLE;
+  rpt.triggerS = DEF_RPT_TRIGGER_S;
+  rpt.hangMs = DEF_RPT_HANG_MS;
+  rpt.totS = DEF_RPT_TOT_S;
+  rpt.gainPct = DEF_RPT_GAIN_PCT;
+  rpt.deemp = DEF_RPT_DEEMP;
+  rpt.courtesy = DEF_RPT_COURTESY;
+  strlcpy(rpt.idCall, DEF_RPT_ID_CALL, sizeof(rpt.idCall));
+  rpt.idWpm = DEF_RPT_ID_WPM;
+  rpt.idFreqHz = DEF_RPT_ID_FREQ_HZ;
+  rpt.idLevelPct = DEF_RPT_ID_LEVEL_PCT;
+  rpt.beepHz = DEF_RPT_BEEP_HZ;
+  rpt.beepMs = DEF_RPT_BEEP_MS;
 }
 
 void ConfigManager::saveGpsTiming() {
@@ -127,5 +160,7 @@ void ConfigManager::resetDefaults() {
   save();
   _gpsTimingDefaults();
   saveGpsTiming();
+  _rptDefaults();
+  saveRpt();
   Serial.println("[Config] Reset to defaults");
 }

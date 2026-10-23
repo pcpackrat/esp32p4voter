@@ -37,6 +37,16 @@ public:
   void processAudioFrame(const uint8_t *ulawData, uint8_t rssi, VTIME frameTime);
 
   bool isConnected() { return _state == VOTER_CONNECTED; }
+
+  // Option flags the host sends in its auth packets (chan_voter / PIC firmware)
+  static const uint8_t OPT_FLATAUDIO = 1;    // don't de-emphasize (nodeemp/hostdeemp)
+  static const uint8_t OPT_SENDALWAYS = 2;   // master: send audio every 20 ms
+  static const uint8_t OPT_NOCTCSS = 4;      // don't PL filter (noplfilter)
+  static const uint8_t OPT_MASTERTIMING = 8; // master timing source
+  uint8_t optionFlags() const { return _optionFlags; }
+  bool sendAlways() const { return isConnectedConst() && (_optionFlags & OPT_SENDALWAYS); }
+  bool hostFlatAudio() const { return _optionFlags & OPT_FLATAUDIO; }
+  bool hostNoPlFilter() const { return _optionFlags & OPT_NOCTCSS; }
   VoterState getState() { return _state; }
   VoterAuthError getAuthError() { return _authError; }
   void setTimingOffset(int16_t ms) { _timingOffsetMs = ms; }
@@ -49,8 +59,13 @@ public:
   uint32_t getHostFramesReceived() { return _hostFramesReceived; }
 
   static const char *stateStr(VoterState s);
+  // State plus the reason when not connected (waiting for GPS, auth error)
+  void statusText(char *buf, size_t len);
 
 private:
+  bool isConnectedConst() const { return _state == VOTER_CONNECTED; }
+  volatile uint8_t _optionFlags = 0; // read by the RX task
+
   GPSManager *_gps;
   WiFiUDP _udp;
   bool _started;
