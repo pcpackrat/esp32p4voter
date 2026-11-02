@@ -21,13 +21,52 @@ DSPProcessor::DSPProcessor() {
   _calib = 50.0f;
   _lastNoiseLevel = 0;
   _lastRms = 0.0f;
+  _lastVoiceRms = 0.0f;
+  _narrowBand = false;
   memset(_rssiHist, 0, sizeof(_rssiHist));
+}
+
+// RBJ cookbook 2nd-order section at 8 kHz (Q 0.707 = Butterworth)
+static void makeBiquad(float fc, bool highPass, float *b0, float *b1, float *b2, float *a1, float *a2,
+                       float q = 0.7071f) {
+  const float w = 2.0f * (float)M_PI * fc / 8000.0f;
+  const float cw = cosf(w), alpha = sinf(w) / (2.0f * q);
+  const float a0 = 1.0f + alpha;
+  if (highPass) {
+    *b0 = (1.0f + cw) / 2.0f / a0;
+    *b1 = -(1.0f + cw) / a0;
+  } else {
+    *b0 = (1.0f - cw) / 2.0f / a0;
+    *b1 = (1.0f - cw) / a0;
+  }
+  *b2 = *b0;
+  *a1 = -2.0f * cw / a0;
+  *a2 = (1.0f - alpha) / a0;
+}
+
+uint8_t DSPProcessor::rssiFromNoise(float rmsQ15) const {
+  // Voter2 formula: cooked_rssi = 255 - (rms_q15 / calib)
+  float cooked = 255.0f - rmsQ15 / _calib;
+  if (cooked < 10.0f)
+    cooked = 10.0f;
+  if (cooked > 255.0f)
+    cooked = 255.0f;
+  return (uint8_t)cooked;
 }
 
 void DSPProcessor::begin() {
   for (int i = 0; i < RSSI_FILTER_TAPS; i++) {
     _rssiCoeffs[i] = (float)rssi_q15[i] / 32768.0f;
   }
+  _vbHp = {};
+  _vbLp = {};
+  makeBiquad(500.0f, true, &_vbHp.b0, &_vbHp.b1, &_vbHp.b2, &_vbHp.a1, &_vbHp.a2);
+  makeBiquad(2500.0f, false, &_vbLp.b0, &_vbLp.b1, &_vbLp.b2, &_vbLp.a1, &_vbLp.a2);
+  // 4th-order Butterworth = sections with Q 0.541 and 1.307
+  _nbLp1 = {};
+  _nbLp2 = {};
+  makeBiquad(3500.0f, false, &_nbLp1.b0, &_nbLp1.b1, &_nbLp1.b2, &_nbLp1.a1, &_nbLp1.a2, 0.5412f);
+  makeBiquad(3500.0f, false, &_nbLp2.b0, &_nbLp2.b1, &_nbLp2.b2, &_nbLp2.a1, &_nbLp2.a2, 1.3066f);
   memset(_rssiHist, 0, sizeof(_rssiHist));
   _voiceFilter.init();
   _deempState = 0.0f;
@@ -42,6 +81,7 @@ uint8_t DSPProcessor::process(int16_t *samples, bool enablePLFilter, bool enable
     _rssiHist[hist + i] = (float)samples[i] / 32768.0f;
   }
 
+  const bool narrow = _narrowBand;
   float energy = 0.0f;
   for (int n = 0; n < DSP_BLOCK_SAMPLES; n++) {
     float acc = 0.0f;
@@ -49,12 +89,22 @@ uint8_t DSPProcessor::process(int16_t *samples, bool enablePLFilter, bool enable
     for (int k = 0; k < RSSI_FILTER_TAPS; k++) {
       acc += _rssiCoeffs[k] * x[-k];
     }
+    if (narrow)
+      acc = _nbLp2.run(_nbLp1.run(acc));
     energy += acc * acc;
   }
   memmove(_rssiHist, &_rssiHist[DSP_BLOCK_SAMPLES], hist * sizeof(float));
 
   float rms = sqrtf(energy / (float)DSP_BLOCK_SAMPLES);
   _lastRms = rms * 32768.0f;
+
+  // Voice band energy (same raw input), for telling speech from noise
+  float vEnergy = 0.0f;
+  for (int i = 0; i < DSP_BLOCK_SAMPLES; i++) {
+    float v = _vbLp.run(_vbHp.run((float)samples[i]));
+    vEnergy += v * v;
+  }
+  _lastVoiceRms = sqrtf(vEnergy / (float)DSP_BLOCK_SAMPLES);
 
   // Voter2 formula: cooked_rssi = 255 - (rms_q15 / calib)
   float cooked = 255.0f - (rms * 32768.0f / _calib);

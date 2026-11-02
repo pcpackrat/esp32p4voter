@@ -129,6 +129,8 @@ void VoterClient::statusText(char *buf, size_t len) {
     snprintf(buf, len, "WAITING FOR GPS (%s)", GPSManager::statusStr(_gps->getLockStatus()));
   } else if (!_timingReady()) {
     snprintf(buf, len, "WAITING FOR AUDIO CLOCK (%s)", _notReadyFn ? _notReadyFn() : "not locked");
+  } else if (_authError == AUTH_ERR_NO_RESPONSE) {
+    snprintf(buf, len, "NO RESPONSE FROM HOST (retrying)");
   } else if (_state == VOTER_AUTHENTICATING) {
     snprintf(buf, len, "AUTHENTICATING");
   } else {
@@ -157,6 +159,10 @@ void VoterClient::update() {
   _update();
   xSemaphoreGive(_lock);
 }
+
+// chan_voter sends a connected client a packet at least every second
+// (TX_KEEPALIVE_MS 1000), so this much silence means the host is gone
+static const uint32_t HOST_TIMEOUT_MS = 5000;
 
 void VoterClient::_update() {
 
@@ -187,19 +193,42 @@ void VoterClient::_update() {
     // Silent failure: warn once after 5 attempts (~10s)
     if (_authAttempts >= 5 && !_hasWarnedAuth) {
       _hasWarnedAuth = true;
-      if (_state == VOTER_AUTHENTICATING) {
-        _authError = AUTH_ERR_CLIENT_REJECTED;
-        Serial.println("[Voter] WARNING: Client Password rejected by Host!");
-      } else if (_lastRxTime == 0) {
+      if (_lastRxTime == 0 || millis() - _lastRxTime > HOST_TIMEOUT_MS) {
+        // Nothing heard from the host: network or host down. Keep trying -
+        // it comes back by itself (and the offline repeater can take over
+        // meanwhile)
         _authError = AUTH_ERR_NO_RESPONSE;
-        Serial.println("[Voter] WARNING: No response from Host. Check network!");
+        Serial.println("[Voter] WARNING: No response from Host. Check network! Still retrying.");
+        logger.warn("VOTER", "No response from host - retrying");
       } else {
+        // The host is answering but won't accept us: a password problem.
+        // Retrying won't fix it.
         _authError = AUTH_ERR_CLIENT_REJECTED;
-        Serial.println("[Voter] WARNING: Client Password rejected (Host silent).");
+        Serial.println(_state == VOTER_AUTHENTICATING ? "[Voter] WARNING: Client Password rejected by Host!"
+                                                      : "[Voter] WARNING: Client Password rejected (Host silent).");
+        _state = VOTER_AUTH_ERROR; // Stop retrying
       }
-      _state = VOTER_AUTH_ERROR; // Stop retrying
+    }
+    // Host answering again after a no-response spell: allow a fresh warning
+    if (_authError == AUTH_ERR_NO_RESPONSE && _lastRxTime != 0 && millis() - _lastRxTime < HOST_TIMEOUT_MS) {
+      _authError = AUTH_ERR_NONE;
+      _authAttempts = 0;
+      _hasWarnedAuth = false;
     }
   } else if (_state == VOTER_CONNECTED) {
+    // 3a. Host gone silent (chan_voter sends at least one packet a second to
+    // a connected client): network or host down
+    if (millis() - _lastRxTime > HOST_TIMEOUT_MS) {
+      Serial.printf("[Voter] Nothing from host for %lu s - disconnected, retrying\r\n",
+                    (unsigned long)(HOST_TIMEOUT_MS / 1000));
+      logger.error("VOTER", "Disconnected: no packets from host for %lu s", (unsigned long)(HOST_TIMEOUT_MS / 1000));
+      _state = VOTER_DISCONNECTED;
+      _authAttempts = 0;
+      _hasWarnedAuth = false;
+      _lastAttemptTime = millis() - 2000; // retry right away
+      return;
+    }
+
     // 3. GPS lock loss (debounced, 1s holdover)
     if (!_timingReady()) {
       if (_gpsLostTime == 0) {

@@ -4,6 +4,7 @@
 #include "Pins.h"
 #include <esp_timer.h>
 #include <math.h>
+#include <sys/time.h>
 #include <time.h>
 
 GPSManager *GPSManager::_instance = nullptr;
@@ -18,15 +19,30 @@ static portMUX_TYPE s_gpsMux = portMUX_INITIALIZER_UNLOCKED;
 #define UBX_CLS_NAV 0x01
 #define UBX_CLS_CFG 0x06
 #define UBX_CLS_TIM 0x0D
+#define UBX_CLS_AID 0x0B
 #define UBX_NAV_STATUS 0x03
 #define UBX_NAV_TIMEUTC 0x21
 #define UBX_CFG_MSG 0x01
+#define UBX_CFG_RST 0x04
 #define UBX_CFG_CFG 0x09
 #define UBX_CFG_TMODE 0x1D
 #define UBX_TIM_SVIN 0x04
+#define UBX_AID_INI 0x01
+#define UBX_AID_HUI 0x02
 
 static const uint32_t TMODE_POLL_MS = 5000;
 static const uint8_t TMODE_MAX_SETS = 3; // per boot - each one writes GPS flash
+
+// Aiding
+static const uint32_t AID_TIME_ACC_MS = 1000;      // NTP time handed to the GPS, claimed accuracy
+static const uint32_t AID_POS_ACC_CM = 10000;      // entered / NMEA position, claimed accuracy (100 m)
+static const uint32_t COLD_FIRST_MS = 5 * 60000;   // no satellites this long after boot -> cold start
+static const uint32_t COLD_REPEAT_MS = 20 * 60000; // then at most this often
+static const uint32_t COLD_AID_DELAY_MS = 5000;    // cold start -> aid again, GPS restarting and old NMEA gone
+static const uint32_t HUI_RETRY_MS = 30000;        // UTC still not valid -> send the leap seconds again
+static const int64_t GPS_EPOCH_UNIX = 315964800;   // 1980-01-06
+static const int64_t GPS_LEAP_S = 18;              // GPS - UTC
+static const time_t MIN_VALID_UNIX = 1704067200;   // 2024-01-01: system clock has been set
 
 // Days since 1970-01-01 for a civil date (proleptic Gregorian).
 static int64_t daysFromCivil(int y, unsigned m, unsigned d) {
@@ -86,6 +102,14 @@ GPSManager::GPSManager() {
   _utcFlagMs = 0;
   _utcValid = false;
   _utcFlagLogged = false;
+  _aidPending = true;
+  _aidNotBefore = 0;
+  _aidSentMs = 0;
+  _aidFlags = 0;
+  _huiSentMs = 0;
+  _noSatSinceMs = 0;
+  _coldWaitMs = COLD_FIRST_MS;
+  _coldStarts = 0;
   _instance = this;
 }
 
@@ -185,7 +209,34 @@ void GPSManager::update() {
     _pollTimeMode();
   }
 
-  // 4. Status transitions with 500ms hysteresis
+  // 4. Start-up aiding and cold start. Only while there is no fix.
+  if (_canSend && _gotByte) {
+    bool haveFix = _tm.gpsFixOk && _navStatusMs != 0 && millis() - _navStatusMs < 3000;
+    if (haveFix || getSatellites() > 0) {
+      _noSatSinceMs = millis();
+      if ((int32_t)(millis() - _aidNotBefore) >= 0)
+        _aidPending = false; // already tracking - nothing to help with
+    } else {
+      if (_noSatSinceMs == 0)
+        _noSatSinceMs = millis();
+      bool netTime = time(nullptr) > MIN_VALID_UNIX;
+      if (_aidPending && (int32_t)(millis() - _aidNotBefore) >= 0 && netTime) {
+        _aidPending = false;
+        _sendAidIni();
+      }
+      if (millis() - _noSatSinceMs > _coldWaitMs) {
+        _coldStart("No satellites");
+      }
+    }
+  }
+
+  // 5. Leap seconds: only while the module says UTC isn't valid, so real
+  // satellite values are never overwritten.
+  if (_canSend && utcBlocked && (_huiSentMs == 0 || millis() - _huiSentMs > HUI_RETRY_MS)) {
+    _sendAidHui();
+  }
+
+  // 6. Status transitions with 500ms hysteresis
   GPSLockStatus currentRaw = _getRawLockStatus();
   if (currentRaw != _pendingStatus) {
     _pendingStatus = currentRaw;
@@ -300,6 +351,133 @@ void GPSManager::_ubxSend(uint8_t cls, uint8_t id, const uint8_t *payload, uint1
   _gpsSerial->write(ck, sizeof(ck));
 }
 
+// AID-INI (48 bytes): pos X/lat, Y/lon, Z/alt I4, posAcc U4 (cm), tmCfg X2,
+// wn U2, tow U4 (ms), towNs I4, tAccMs U4, tAccNs U4, clkD I4, clkDAcc U4,
+// flags X4 (0x01 position valid, 0x02 time valid, 0x20 position is lat/lon/alt)
+bool GPSManager::_sendAidIni() {
+  uint8_t p[48] = {0};
+  uint32_t flags = 0;
+  const GpsAidConfig &a = cfg.gpsAid;
+  const GpsTimingConfig &t = cfg.gpsTm;
+  if (a.set) {
+    wrU4(p, (uint32_t)a.latE7);
+    wrU4(p + 4, (uint32_t)a.lonE7);
+    wrU4(p + 8, (uint32_t)a.altCm);
+    wrU4(p + 12, AID_POS_ACC_CM);
+    flags |= 0x01 | 0x20;
+  } else if (t.fixedX || t.fixedY || t.fixedZ) {
+    wrU4(p, (uint32_t)t.fixedX);
+    wrU4(p + 4, (uint32_t)t.fixedY);
+    wrU4(p + 8, (uint32_t)t.fixedZ);
+    uint32_t accCm = t.fixedAccMm / 10;
+    wrU4(p + 12, accCm < 100 ? 100 : accCm);
+    flags |= 0x01;
+  }
+
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  if (tv.tv_sec > MIN_VALID_UNIX) {
+    int64_t gpsMs = ((int64_t)tv.tv_sec - GPS_EPOCH_UNIX + GPS_LEAP_S) * 1000 + tv.tv_usec / 1000;
+    uint16_t wn = (uint16_t)(gpsMs / 604800000LL);
+    uint32_t tow = (uint32_t)(gpsMs % 604800000LL);
+    p[18] = wn & 0xFF;
+    p[19] = wn >> 8;
+    wrU4(p + 20, tow);
+    wrU4(p + 28, AID_TIME_ACC_MS);
+    flags |= 0x02;
+  }
+
+  if (!flags) {
+    logger.info("GPS", "No network time or saved position - no aiding sent");
+    return false;
+  }
+  wrU4(p + 44, flags);
+  _ubxSend(UBX_CLS_AID, UBX_AID_INI, p, sizeof(p));
+  _aidSentMs = millis();
+  _aidFlags = flags;
+  logger.info("GPS", "Aiding sent: %s%s%s", (flags & 0x02) ? "network time" : "",
+              (flags & 0x03) == 0x03 ? " + " : "",
+              (flags & 0x01) ? (a.set ? "saved position" : "survey position") : "");
+  // Decoded from the payload, so this is what actually went to the GPS
+  if (flags & 0x02) {
+    time_t sec = tv.tv_sec;
+    struct tm tm;
+    gmtime_r(&sec, &tm);
+    logger.info("GPS", "Aiding time: %04d-%02d-%02d %02d:%02d:%02d UTC, GPS week %u tow %lu ms, +/-%lu ms",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+                (unsigned)rdU2(p + 18), (unsigned long)rdU4(p + 20), (unsigned long)rdU4(p + 28));
+  }
+  if (flags & 0x01) {
+    double lat, lon, alt;
+    if (flags & 0x20) {
+      lat = rdI4(p) / 1e7;
+      lon = rdI4(p + 4) / 1e7;
+      alt = rdI4(p + 8) / 100.0;
+    } else {
+      ecefToLlh(rdI4(p), rdI4(p + 4), rdI4(p + 8), &lat, &lon, &alt);
+    }
+    logger.info("GPS", "Aiding position: %.7f, %.7f, %.1f m, +/-%.1f m", lat, lon, alt, rdU4(p + 12) / 100.0);
+  }
+  return true;
+}
+
+// AID-HUI (72 bytes): only the leap seconds are set. utcLS (byte 26) and utcLSF
+// (byte 32) are both GPS_LEAP_S, the leap event date stays zero (long past).
+// flags (byte 68) 0x02 = UTC fields valid; health and iono are marked not valid.
+void GPSManager::_sendAidHui() {
+  uint8_t p[72] = {0};
+  p[26] = (uint8_t)GPS_LEAP_S;
+  p[32] = (uint8_t)GPS_LEAP_S;
+  wrU4(p + 68, 0x02);
+  _ubxSend(UBX_CLS_AID, UBX_AID_HUI, p, sizeof(p));
+  _ubxSend(UBX_CLS_AID, UBX_AID_HUI, nullptr, 0); // poll: read back what the module holds
+  _huiSentMs = millis();
+  logger.info("GPS", "Leap seconds sent: %d", (int)GPS_LEAP_S);
+}
+
+// CFG-RST: clear all navigation data (almanac, ephemeris, position, time),
+// GPS-only controlled reset - settings and the ESP32 are not touched.
+void GPSManager::_coldStart(const char *why) {
+  uint8_t p[4] = {0xFF, 0xFF, 0x02, 0x00};
+  _ubxSend(UBX_CLS_CFG, UBX_CFG_RST, p, sizeof(p));
+  _coldStarts++;
+  _coldWaitMs = COLD_REPEAT_MS;
+  _noSatSinceMs = millis();
+  _tm.gpsFixOk = false;
+  logger.warn("GPS", "%s - GPS cold start #%u", why, (unsigned)_coldStarts);
+  // Aid again once the receiver has restarted
+  _aidPending = true;
+  _aidNotBefore = millis() + COLD_AID_DELAY_MS;
+}
+
+void GPSManager::coldStart() { _coldStart("Web page request"); }
+
+void GPSManager::requestAid() {
+  _aidPending = true;
+  _aidNotBefore = millis();
+}
+
+bool GPSManager::getCurrentPosition(double *latDeg, double *lonDeg, double *altM) {
+  if (!_gpsParser.location.isValid() || _gpsParser.location.age() > 5000)
+    return false;
+  *latDeg = _gpsParser.location.lat();
+  *lonDeg = _gpsParser.location.lng();
+  *altM = _gpsParser.altitude.isValid() ? _gpsParser.altitude.meters() : 0.0;
+  return true;
+}
+
+void GPSManager::aidSummary(char *buf, size_t len) {
+  char sent[64];
+  if (_aidSentMs) {
+    snprintf(sent, sizeof(sent), "sent %lu s after boot (%s%s%s)", (unsigned long)(_aidSentMs / 1000),
+             (_aidFlags & 0x02) ? "time" : "", (_aidFlags & 0x03) == 0x03 ? " + " : "",
+             (_aidFlags & 0x01) ? "position" : "");
+  } else {
+    snprintf(sent, sizeof(sent), "%s", _aidPending ? "waiting" : "not needed (already tracking)");
+  }
+  snprintf(buf, len, "Aiding %s. Cold starts this boot: %u", sent, (unsigned)_coldStarts);
+}
+
 void GPSManager::_pollTimeMode() {
   _lastPollMs = millis();
   _ubxSend(UBX_CLS_CFG, UBX_CFG_TMODE, nullptr, 0);
@@ -399,9 +577,10 @@ void GPSManager::_ubxHandle() {
     _utcFlagMs = millis();
     if (validUtc != _utcValid || !_utcFlagLogged) {
       _utcFlagLogged = true;
-      if (validUtc)
-        logger.info("GPS", "UTC valid (leap seconds known)");
-      else
+      if (validUtc) {
+        logger.info("GPS", "UTC valid (leap seconds known), %lu s after boot", (unsigned long)(millis() / 1000));
+        _ubxSend(UBX_CLS_AID, UBX_AID_HUI, nullptr, 0); // log what the module ended up with
+      } else
         logger.warn("GPS", "UTC not valid yet - leap seconds unknown, time held until they arrive (up to ~12.5 min)");
     }
     _utcValid = validUtc;
@@ -420,6 +599,12 @@ void GPSManager::_ubxHandle() {
       _ubxTimeMs = millis();
       _ubxTimeSeen = true;
     }
+
+  } else if (_ubxClass == UBX_CLS_AID && _ubxId == UBX_AID_HUI && _ubxLen == 72) {
+    // utcWNF is non-zero when the values came from the satellites, 0 when they are ours
+    logger.info("GPS", "AID-HUI readback: utcLS %d, utcLSF %d, utcWNF %d, flags 0x%02lX",
+                (int)(int16_t)rdU2(p + 26), (int)(int16_t)rdU2(p + 32), (int)(int16_t)rdU2(p + 28),
+                (unsigned long)rdU4(p + 68));
   }
 }
 

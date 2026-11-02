@@ -36,6 +36,9 @@
 #ifndef DEF_NET_IFACE
 #define DEF_NET_IFACE NET_IFACE_AUTO // NET_IFACE_AUTO / _ETH / _WIFI
 #endif
+#ifndef DEF_DEVICE_HOSTNAME
+#define DEF_DEVICE_HOSTNAME "p4-voter" // DHCP / WiFi name of this device
+#endif
 #ifndef DEF_USE_STATIC_IP
 #define DEF_USE_STATIC_IP false
 #endif
@@ -76,6 +79,7 @@
 #define DEF_DSP_CALIB 50.0f         // uncalibrated DSP RSSI scale
 #define DEF_DSP_SQL_OPEN 80         // calibrated DSP squelch, RSSI 0-255
 #define DEF_DSP_SQL_HYST 8
+#define DEF_DSP_BEW_MODE 0          // DSP RSSI hold during voice: 0 off, 1 normal, 2 sensitive
 #define DEF_USE_HW_RSSI false
 #define DEF_RSSI_MIN 200            // raw counts at no signal
 #define DEF_RSSI_MAX 3000           // raw counts at full quieting
@@ -96,6 +100,7 @@
 #endif
 #define DEF_RPT_ENABLE false
 #define DEF_RPT_TRIGGER_S 30        // not connected this long -> offline repeater
+#define DEF_RPT_BOOT_DELAY_S 180     // no takeover in the first 3 min after power-up
 #define DEF_RPT_HANG_MS 1000
 #define DEF_RPT_TOT_S 180           // timeout timer, 0 = off
 #define DEF_RPT_GAIN_PCT 100
@@ -106,6 +111,11 @@
 #define DEF_RPT_ID_WPM 20
 #define DEF_RPT_ID_FREQ_HZ 800
 #define DEF_RPT_ID_LEVEL_PCT 15     // about -16 dBFS
+
+// --- WireGuard remote access (all set on the WireGuard web page) ---
+#define DEF_WG_PORT 51820
+#define DEF_WG_NETMASK 255, 255, 255, 0
+#define DEF_WG_KEEPALIVE_S 25
 
 // --- GPS timing mode (LEA-5T) ---
 #define DEF_GPS_TMODE GPS_TMODE_OFF

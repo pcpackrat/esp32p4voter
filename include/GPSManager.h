@@ -66,6 +66,15 @@ public:
   // WGS84 conversion for showing the fixed position (ECEF in cm)
   static void ecefToLlh(int32_t x, int32_t y, int32_t z, double *latDeg, double *lonDeg, double *hM);
 
+  // Current NMEA position, false if there is no recent fix
+  bool getCurrentPosition(double *latDeg, double *lonDeg, double *altM);
+
+  // Start-up aiding: network time + saved position (UBX AID-INI) once after
+  // boot, and a GPS cold start if no satellites are used for a long time.
+  void requestAid(); // send the aiding again (e.g. after the position changed)
+  void coldStart();  // from the GPS web page
+  void aidSummary(char *buf, size_t len);
+
   static const char *statusStr(GPSLockStatus s);
 
 private:
@@ -95,7 +104,7 @@ private:
   uint8_t _ubxClass, _ubxId;
   uint16_t _ubxLen, _ubxPos;
   uint8_t _ubxCkA, _ubxCkB;
-  uint8_t _ubxBuf[64];
+  uint8_t _ubxBuf[72]; // largest message used: AID-HUI
 
   TimingStatus _tm;
   bool _canSend;
@@ -109,7 +118,20 @@ private:
   bool _utcValid;      // its validUTC flag (leap seconds known)
   bool _utcFlagLogged;
 
+  // Aiding / cold start
+  bool _aidPending;      // AID-INI still to be sent
+  uint32_t _aidNotBefore; // millis() - wait after a reset before aiding
+  uint32_t _aidSentMs;    // 0 = not sent this boot
+  uint32_t _aidFlags;     // what the last AID-INI carried
+  uint32_t _huiSentMs;    // last AID-HUI (leap seconds), 0 = not sent this boot
+  uint32_t _noSatSinceMs; // start of the current no-satellite period
+  uint32_t _coldWaitMs;   // no-satellite time before the next cold start
+  uint8_t _coldStarts;
+
   void _ubxByte(uint8_t c);
+  bool _sendAidIni();
+  void _sendAidHui();
+  void _coldStart(const char *why);
   void _ubxHandle();
   void _ubxSend(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len);
   void _pollTimeMode();

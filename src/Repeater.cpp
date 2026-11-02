@@ -71,32 +71,37 @@ void Repeater::_setActive(bool on) {
   }
 }
 
-// Build the tone sequence (loop task) and hand it to the TX task
+// Append text as Morse elements (tone > 0, gap < 0, in samples)
+void Repeater::_addMorse(const char *text, int32_t dit) {
+  for (const char *p = text; *p && _elCount < MAX_ELEMENTS - 16; p++) {
+    if (*p == ' ') {
+      _el[_elCount++] = -dit * 4; // word gap (7 total with the char gap)
+      continue;
+    }
+    const char *code = morse(*p);
+    if (!code)
+      continue;
+    for (const char *e = code; *e; e++) {
+      _el[_elCount++] = (*e == '-') ? dit * 3 : dit;
+      _el[_elCount++] = e[1] ? -dit : -dit * 3; // element / character gap
+    }
+  }
+}
+
+// Build the tone sequence (loop task) and hand it to the TX task. Both the
+// ID and the courtesy tone (Morse F) are sent at the ID speed.
 void Repeater::_startTones(bool id) {
   if (_toneBusy || _toneStartReq)
     return;
   _elCount = 0;
+  uint8_t wpm = cfg.rpt.idWpm ? cfg.rpt.idWpm : 20;
+  int32_t dit = (int32_t)RPT_SAMPLE_RATE * 1200 / 1000 / wpm; // 1200/wpm ms
   if (id) {
-    uint8_t wpm = cfg.rpt.idWpm ? cfg.rpt.idWpm : 20;
-    int32_t dit = (int32_t)RPT_SAMPLE_RATE * 1200 / 1000 / wpm; // 1200/wpm ms
     _el[_elCount++] = -dit * 3; // lead-in
-    for (const char *p = cfg.rpt.idCall; *p && _elCount < MAX_ELEMENTS - 16; p++) {
-      if (*p == ' ') {
-        _el[_elCount++] = -dit * 4; // word gap (7 total with the char gap)
-        continue;
-      }
-      const char *code = morse(*p);
-      if (!code)
-        continue;
-      for (const char *e = code; *e; e++) {
-        _el[_elCount++] = (*e == '-') ? dit * 3 : dit;
-        _el[_elCount++] = e[1] ? -dit : -dit * 3; // element / character gap
-      }
-    }
+    _addMorse(cfg.rpt.idCall, dit);
     _toneFreq = cfg.rpt.idFreqHz ? cfg.rpt.idFreqHz : 800;
   } else {
-    uint16_t ms = cfg.rpt.beepMs ? cfg.rpt.beepMs : 120;
-    _el[_elCount++] = (int32_t)RPT_SAMPLE_RATE * ms / 1000;
+    _addMorse("F", dit); // courtesy tone: ..-.
     _toneFreq = cfg.rpt.beepHz ? cfg.rpt.beepHz : 880;
   }
   _toneAmp = 32767.0f * cfg.rpt.idLevelPct / 100.0f;
@@ -123,8 +128,18 @@ void Repeater::update(bool hostConnected, bool cos) {
   } else {
     if (_notConnSince == 0)
       _notConnSince = now;
-    if (!_active && now - _notConnSince >= (uint32_t)cfg.rpt.triggerS * 1000UL)
+    // Startup delay: at power-up the voter needs GPS, the audio clock and the
+    // host before it connects - that is not an outage
+    bool booting = now < (uint32_t)cfg.rpt.bootDelayS * 1000UL;
+    if (!_active && !booting && now - _notConnSince >= (uint32_t)cfg.rpt.triggerS * 1000UL) {
       _setActive(true);
+      // Announce the repeater with the ID straight away (over any audio)
+      _startTones(true);
+      _lastIdMs = now;
+      _idEver = true;
+      _txSinceId = false;
+      _idDueSince = 0;
+    }
   }
   if (!_active) {
     _keyed = false;
@@ -269,12 +284,19 @@ void Repeater::stateStr(char *buf, size_t len) {
   } else if (cfg.rpt.idCall[0] == '\0') {
     snprintf(buf, len, "Enabled but no ID callsign set - will not transmit");
   } else if (!_active) {
+    uint32_t now = millis();
     if (_notConnSince == 0) {
       snprintf(buf, len, "Standby (host connected)");
     } else {
-      uint32_t el = (millis() - _notConnSince) / 1000;
+      uint32_t el = (now - _notConnSince) / 1000;
       uint32_t left = el < cfg.rpt.triggerS ? cfg.rpt.triggerS - el : 0;
-      snprintf(buf, len, "Standby - host not connected, takes over in %lu s", (unsigned long)left);
+      uint32_t up = now / 1000;
+      uint32_t bootLeft = up < cfg.rpt.bootDelayS ? cfg.rpt.bootDelayS - up : 0;
+      if (bootLeft > left)
+        snprintf(buf, len, "Standby - startup delay, takes over in %lu s if the host is still not connected",
+                 (unsigned long)bootLeft);
+      else
+        snprintf(buf, len, "Standby - host not connected, takes over in %lu s", (unsigned long)left);
     }
   } else if (_totTripped) {
     snprintf(buf, len, "ACTIVE - timeout timer, waiting for the input to drop");

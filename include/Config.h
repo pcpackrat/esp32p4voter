@@ -8,8 +8,9 @@
 // v2: netIface. v3: DSP RSSI calibration. v4: DSP squelch level/hysteresis.
 // v5: RSSI scale 0-127 -> 0-255 (dspSqlOpen doubled on migration).
 // v6: GPS-locked audio timebase - Timing Offset is now a trim, reset to 0.
+// v8: device hostname.
 // Older versions are migrated: new fields are only ever added at the end.
-#define CONFIG_VERSION 7
+#define CONFIG_VERSION 10
 
 // Network interface selection
 #define NET_IFACE_AUTO 0 // Ethernet when a cable is connected, otherwise WiFi
@@ -83,6 +84,16 @@ struct SysConfig {
   // dspSqlHyst units past the opening point.
   uint8_t dspSqlOpen;
   uint8_t dspSqlHyst;
+
+  // This device's network name (v8): DHCP hostname, WiFi station name
+  char deviceHostname[32];
+
+  // DSP RSSI hold during voice, like the PIC DSPBEW option (v9):
+  // 0 off, 1 normal, 2 sensitive, 3 noise floor tracking
+  uint8_t dspBewMode;
+
+  // DSP noise band (v10): false = 2.8-4 kHz, true = 2.8-3.5 kHz
+  bool dspNarrowBand;
 };
 
 // GPS timing mode (u-blox LEA-5T CFG-TMODE)
@@ -97,6 +108,14 @@ struct GpsTimingConfig {
   uint32_t svinAccMm;             // Survey-in accuracy target (1 sigma)
   int32_t fixedX, fixedY, fixedZ; // Fixed position, ECEF cm. All 0 = none
   uint32_t fixedAccMm;            // Fixed position accuracy (1 sigma)
+};
+
+// Position handed to the GPS at boot (UBX AID-INI) together with the network
+// time, so it searches for the right satellites. Own NVS key.
+struct GpsAidConfig {
+  bool set;
+  int32_t latE7, lonE7; // degrees * 1e7
+  int32_t altCm;
 };
 
 // Offline repeater (failover when the voter host is not connected).
@@ -116,7 +135,30 @@ struct RptConfig {
   // Added later - keep new fields at the end (older saved blocks are loaded
   // as a prefix and the rest takes defaults)
   uint16_t beepHz; // courtesy tone
-  uint16_t beepMs;
+  uint16_t beepMs; // unused: the courtesy tone is Morse F at the ID speed
+  uint16_t bootDelayS; // no takeover until this long after power-up
+};
+
+// WireGuard remote access (split tunnel: only the tunnel subnet is routed
+// through it). Stored under its own NVS key like RptConfig.
+#define WG_KEY_B64_LEN 44 // base64 of a 32-byte key
+#define WG_MAX_ROUTES 4
+struct WgConfig {
+  bool enable;
+  char privateKey[WG_KEY_B64_LEN + 4];    // this device, base64
+  char peerPublicKey[WG_KEY_B64_LEN + 4]; // server (pfSense), base64
+  char presharedKey[WG_KEY_B64_LEN + 4];  // optional, empty = none
+  char endpoint[64];                      // server hostname or IP
+  uint16_t endpointPort;
+  uint32_t address;    // this device's tunnel IP
+  uint32_t netmask;    // tunnel subnet - routed through the tunnel
+  uint16_t keepaliveS; // persistent keepalive, 0 = off
+  // Added later - keep new fields at the end (older blocks load as a prefix)
+  // Remote subnets also routed through the tunnel (e.g. the LAN behind the
+  // server). Network byte order, same as address/netmask.
+  uint8_t nRoutes;
+  uint32_t routeNet[WG_MAX_ROUTES];
+  uint32_t routeMask[WG_MAX_ROUTES];
 };
 
 class ConfigManager {
@@ -125,17 +167,22 @@ public:
   void save();
   void resetDefaults();
   void saveGpsTiming();
+  void saveGpsAid();
   void saveRpt();
+  void saveWg();
 
   IPAddress hostIP() const { return IPAddress(data.hostIP); }
 
   SysConfig data;
   GpsTimingConfig gpsTm;
+  GpsAidConfig gpsAid;
   RptConfig rpt;
+  WgConfig wg;
 
 private:
   void _gpsTimingDefaults();
   void _rptDefaults();
+  void _wgDefaults();
 };
 
 extern ConfigManager cfg;

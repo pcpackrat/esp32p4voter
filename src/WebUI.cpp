@@ -1,10 +1,12 @@
 #include "WebUI.h"
 #include "App.h"
 #include "Config.h"
+#include "Defaults.h"
 #include "Logger.h"
 #include "NetManager.h"
 #include "Repeater.h"
 #include "Version.h"
+#include "WgTunnel.h"
 #include <ETH.h>
 #include <Update.h>
 #include <WebServer.h>
@@ -19,12 +21,14 @@ static const char *HTML_STYLE = R"rawliteral(
 body{font-family:Arial,sans-serif;margin:0;padding:20px;background:#2c3e50;color:#ecf0f1}
 .container{max-width:800px;margin:0 auto}
 .card{background:#34495e;padding:20px;margin:10px 0;border-radius:8px;box-shadow:0 4px 6px rgba(0,0,0,0.3)}
-h1{color:#3498db;margin-top:0}
+h1{color:#3498db;margin-top:0;margin-bottom:4px}
+.dev{color:#95a5a6;margin-bottom:15px}
 h2{color:#ecf0f1;border-bottom:2px solid #3498db;padding-bottom:10px}
 .btn{background:#3498db;color:#fff;border:none;padding:10px 20px;border-radius:4px;cursor:pointer;font-size:16px;margin:5px}
 .btn:hover{background:#2980b9}
 label{display:block;margin:15px 0 5px 0;font-weight:bold;color:#bdc3c7}
 input[type="text"],input[type="password"],input[type="number"],select{width:100%;padding:10px;margin:5px 0;border-radius:4px;border:1px solid #7f8c8d;background:#ecf0f1;color:#2c3e50;box-sizing:border-box}
+input::placeholder{color:#95a5a6;font-style:italic;opacity:1}
 .nav{margin-bottom:20px}
 .nav a{color:#3498db;text-decoration:none;margin-right:15px;font-weight:bold}
 .nav a:hover{color:#ecf0f1}
@@ -74,12 +78,14 @@ static String jsonEscape(const char *s) {
 static String htmlHeader(const char *title) {
   String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">";
   html += "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
-  html += "<title>P4 Voter - " + String(title) + "</title>";
+  html += "<title>" + htmlEscape(cfg.data.deviceHostname) + " - " + String(title) + "</title>";
   html += HTML_STYLE;
   html += "<script>function toggleShow(id){var e=document.getElementById(id);e.type=(e.type==='password')?'text':'password';}</script>";
   html += "</head><body><div class=\"container\">";
-  html += "<h1>" FIRMWARE_NAME "</h1>";
-  html += "<div class=\"nav\"><a href=\"/\">Status</a><a href=\"/voter\">Voter</a><a href=\"/radio\">Radio</a><a href=\"/network\">Network</a><a href=\"/wifi\">WiFi</a><a href=\"/gps\">GPS</a><a href=\"/repeater\">Repeater</a><a href=\"/update\">Firmware</a></div>";
+  // Device name first (tells units apart), then the device type
+  html += "<h1>" + htmlEscape(cfg.data.deviceHostname) + "</h1>";
+  html += "<div class=\"dev\">" FIRMWARE_NAME " v" FIRMWARE_VERSION "</div>";
+  html += "<div class=\"nav\"><a href=\"/\">Status</a><a href=\"/voter\">Voter</a><a href=\"/radio\">Radio</a><a href=\"/tone\">Test Tone</a><a href=\"/network\">Network</a><a href=\"/wifi\">WiFi</a><a href=\"/gps\">GPS</a><a href=\"/repeater\">Repeater</a><a href=\"/wireguard\">WireGuard</a><a href=\"/update\">Firmware</a></div>";
   return html;
 }
 
@@ -142,6 +148,7 @@ static void handleRoot() {
           "<tr><td>Interface</td><td id=\"iface\">-</td></tr>"
           "<tr><td>IP</td><td id=\"ip\">-</td></tr>"
           "<tr><td>Link</td><td id=\"link\">-</td></tr>"
+          "<tr><td>WireGuard</td><td id=\"wg\">-</td></tr>"
           "</table></div>";
   html += "<div class=\"card\"><h2>System</h2><table>"
           "<tr><td>Firmware</td><td>" FIRMWARE_VERSION " (" BUILD_DATE ")</td></tr>"
@@ -156,7 +163,7 @@ static void handleRoot() {
           "function poll(){fetch('/api/status').then(function(r){return r.json();}).then(function(s){"
           "st('voter',s.voter,s.voter.indexOf('CONNECTED')==0);st('host',s.host);st('sent',s.sent);"
           "if(s.rpt.indexOf('ACTIVE')==0)st('rpt',s.rpt,true);else st('rpt',s.rpt);"
-          "st('cos',s.cos?'OPEN':'closed',s.cos);st('rssi',s.rssi+(s.hwrssi?' (hardware)':' (DSP)'));"
+          "st('cos',s.cos?'OPEN':'closed',s.cos);st('rssi',s.rssi+(s.hwrssi?' (hardware)':(s.rheld>0?' (DSP, held '+s.rheld+'% - voice)':' (DSP)')));"
           "st('noise',s.noise);st('rssiraw',s.rssiraw);"
           "st('adcpk',db(s.adcpk)+' FS');st('encpk',db(s.encpk),s.encpk<-1);"
           "st('ppm',s.aclk+', '+s.ppm.toFixed(2)+' ppm, PPS phase error '+s.phus.toFixed(1)+' us',s.aclk=='LOCKED');"
@@ -169,6 +176,7 @@ static void handleRoot() {
           "st('nmea',s.nmage<0?'nothing received':s.nmea+' chars, '+s.nmok+' good / '+s.nmbad+' bad, last '+(s.nmage/1000).toFixed(1)+' s ago',"
           "s.nmage>=0&&s.nmage<2000&&s.nmok>0);st('ppsok',s.ppsok?'OK (1 Hz)':'none',s.ppsok);st('tmode',s.tmode);"
           "st('iface',s.iface,s.iface=='ETH'||s.iface=='WIFI');st('ip',s.ip);st('link',s.link);"
+          "if(s.wg=='DISABLED')st('wg','off');else st('wg',s.wg,s.wg.indexOf('UP')==0);"
           "st('up',s.up+' s');st('heap',s.heap+' bytes');"
           "}).catch(function(){}).finally(function(){setTimeout(poll,1000);});}"
           "poll();</script>";
@@ -187,6 +195,8 @@ static void handleApiStatus() {
   gps.getGPSStrings(lat, lon, elev);
   char timing[160];
   gps.timingSummary(timing, sizeof(timing));
+  char wgState[192];
+  wgTunnel.statusText(wgState, sizeof(wgState));
   char rptState[96];
   rpt.stateStr(rptState, sizeof(rptState));
   char voterState[96];
@@ -213,10 +223,10 @@ static void handleApiStatus() {
                                                : voter.getHostIP().toString();
   host += ":" + String(cfg.data.hostPort);
 
-  char buf[1536];
+  char buf[1792];
   snprintf(buf, sizeof(buf),
-           "{\"voter\":\"%s\",\"host\":\"%s\",\"sent\":%lu,\"rpt\":\"%s\","
-           "\"cos\":%s,\"rssi\":%u,\"hwrssi\":%s,\"rssiraw\":%u,\"noise\":%u,\"adcpk\":%.1f,\"encpk\":%.1f,"
+           "{\"voter\":\"%s\",\"host\":\"%s\",\"sent\":%lu,\"rpt\":\"%s\",\"wg\":\"%s\","
+           "\"cos\":%s,\"rssi\":%u,\"hwrssi\":%s,\"rheld\":%u,\"rssiraw\":%u,\"noise\":%u,\"adcpk\":%.1f,\"encpk\":%.1f,"
            "\"ppm\":%.2f,\"ppmok\":%s,\"aclk\":\"%s\",\"phus\":%.1f,\"sage\":%.1f,\"smax\":%.1f,\"cap\":%lu,\"drop\":%lu,\"rderr\":%lu,\"codec\":%s,"
            "\"ptt\":%s,\"hostfr\":%lu,\"played\":%lu,\"jb\":%u,\"jbbuf\":%s,\"txpk\":%.1f,\"wrerr\":%lu,"
            "\"gps\":\"%s\",\"sats\":%lu,\"utc\":\"%s\",\"jit\":%lu,"
@@ -225,8 +235,8 @@ static void handleApiStatus() {
            "\"iface\":\"%s\",\"ip\":\"%s\",\"link\":\"%s\",\"up\":%lu,\"heap\":%lu}",
            jsonEscape(voterState).c_str(), jsonEscape(host.c_str()).c_str(),
            (unsigned long)voter.getAudioFramesSent(), jsonEscape(rptState).c_str(),
-           g_status.cos ? "true" : "false",
-           (unsigned)g_status.rssi, cfg.data.useHwRSSI ? "true" : "false",
+           jsonEscape(wgState).c_str(), g_status.cos ? "true" : "false",
+           (unsigned)g_status.rssi, cfg.data.useHwRSSI ? "true" : "false", (unsigned)g_status.rssiHeldPct,
            (unsigned)g_status.rssiRaw, (unsigned)g_status.noise, peakDb(g_status.adcPeak, 32768.0f),
            peakDb(g_status.encPeak, (float)ULAW_CLIP_LEVEL), (double)g_status.clockPpm,
            g_status.clockPpmValid ? "true" : "false", GpsAudio::stateStr(gpsAudio.state()),
@@ -315,6 +325,18 @@ static void handleRadio() {
   html += "<label>DSP Squelch Threshold, uncalibrated only (0-255, noise level above this = closed):</label><input type=\"number\" min=\"0\" max=\"255\" name=\"dspSquelch\" value=\"" + String(cfg.data.dspSquelchThresh) + "\">";
   html += "<label>DSP Squelch Hysteresis (closes this many units past the opening point):</label><input type=\"number\" min=\"0\" max=\"60\" name=\"dspSqlHyst\" value=\"" + String(cfg.data.dspSqlHyst) + "\">";
   html += "<label>DSP RSSI Calibration (higher = more noise before RSSI drops):</label><input type=\"number\" step=\"0.1\" min=\"1\" max=\"1000\" name=\"dspCalib\" value=\"" + String(cfg.data.dspCalib, 1) + "\">";
+  html += "<label>DSP RSSI hold during voice (like the PIC DSPBEW option - keeps loud speech from pulling DSP RSSI down; no effect on hardware RSSI):</label><select name=\"dspBew\">";
+  html += String("<option value=\"0\"") + (cfg.data.dspBewMode == 0 ? " selected" : "") + ">Off</option>";
+  html += String("<option value=\"1\"") + (cfg.data.dspBewMode == 1 ? " selected" : "") + ">Normal</option>";
+  html += String("<option value=\"2\"") + (cfg.data.dspBewMode == 2 ? " selected" : "") + ">Sensitive (holds on quieter voice)</option>";
+  html += String("<option value=\"3\"") + (cfg.data.dspBewMode == 3 ? " selected" : "") +
+          ">Noise floor tracking (lowest noise of last 300 ms - best when the radio rolls off above ~3.5 kHz)</option>";
+  html += "</select>";
+  html += "<label>DSP noise band (re-run RSSI calibration after changing):</label><select name=\"dspBand\">";
+  html += String("<option value=\"0\"") + (!cfg.data.dspNarrowBand ? " selected" : "") + ">Standard 2.8-4 kHz</option>";
+  html += String("<option value=\"1\"") + (cfg.data.dspNarrowBand ? " selected" : "") +
+          ">Narrow 2.8-3.5 kHz (radio audio rolls off by ~3.5 kHz, e.g. MTR3000)</option>";
+  html += "</select>";
 
   html += "<h2>RSSI</h2>";
   html += "<p><a href=\"/rssical\" class=\"btn\">Run RSSI calibration</a> DSP RSSI: ";
@@ -342,12 +364,54 @@ static void handleRadio() {
   html += checkbox("pttInvert", cfg.data.pttInvert, "Invert PTT output (unchecked = GPIO2 HIGH keys the radio through the NPN)");
   html += "<label>PTT Tail (ms after the last host audio):</label><input type=\"number\" min=\"0\" max=\"5000\" name=\"pttTail\" value=\"" + String(cfg.data.pttTailMs) + "\">";
   html += "<label>Jitter Buffer (ms before playback starts):</label><input type=\"number\" min=\"20\" max=\"1500\" name=\"jitterMs\" value=\"" + String(cfg.data.jitterMs) + "\">";
-  html += "<input type=\"submit\" value=\"Save &amp; Reboot\" class=\"btn\"></form></div>";
+  html += "<input type=\"submit\" value=\"Save\" class=\"btn\"></form></div>";
   html += htmlFooter();
   webServer.send(200, "text/html", html);
 }
 
+// ---------------------------------------------------------------------------
+// TX test tone
+// ---------------------------------------------------------------------------
+static uint16_t s_toneHz = 1000; // last entered values, shown again after Start/Stop
+static int s_toneDbfs = -20;
+static int s_toneSecs = 5;
+
+static void handleTone() {
+  String html = htmlHeader("Test Tone");
+  html += "<div class=\"card\"><h2>TX Test Tone</h2><form method=\"POST\" action=\"/tone\">";
+  html += "<p>Keys PTT and sends a sine tone through TX Gain in place of host audio. "
+          "Compare levels at different frequencies on a receiver or service monitor.</p>";
+  html += "<label>Frequency (Hz, 50-3500):</label><input type=\"number\" min=\"50\" max=\"3500\" name=\"hz\" value=\"" +
+          String(s_toneHz) + "\">";
+  html += "<label>Level (dBFS, -40 to 0):</label><input type=\"number\" min=\"-40\" max=\"0\" name=\"dbfs\" value=\"" +
+          String(s_toneDbfs) + "\">";
+  html += "<label>Duration (s, 1-60):</label><input type=\"number\" min=\"1\" max=\"60\" name=\"secs\" value=\"" +
+          String(s_toneSecs) + "\">";
+  html += String("<p>Tone is ") + (testToneActive() ? "<b>ON</b> (" + String(g_testTone.hz) + " Hz)" : String("off")) + ".</p>";
+  html += "<input type=\"submit\" name=\"go\" value=\"Start\" class=\"btn\"> "
+          "<input type=\"submit\" name=\"stop\" value=\"Stop\" class=\"btn\"></form></div>";
+  html += htmlFooter();
+  webServer.send(200, "text/html", html);
+}
+
+static void handleTonePost() {
+  s_toneHz = (uint16_t)constrain(webServer.arg("hz").toInt(), 50, 3500);
+  s_toneDbfs = constrain(webServer.arg("dbfs").toInt(), -40, 0);
+  s_toneSecs = constrain(webServer.arg("secs").toInt(), 1, 60);
+  if (webServer.hasArg("stop")) {
+    g_testTone.untilMs = 0;
+  } else {
+    g_testTone.hz = s_toneHz;
+    g_testTone.amp = 32767.0f * powf(10.0f, (float)s_toneDbfs / 20.0f);
+    uint32_t until = millis() + (uint32_t)s_toneSecs * 1000;
+    g_testTone.untilMs = until ? until : 1;
+  }
+  webServer.sendHeader("Location", "/tone", true);
+  webServer.send(303, "text/plain", "");
+}
+
 static void handleRadioPost() {
+  uint16_t oldJitterMs = cfg.data.jitterMs;
   cfg.data.cosMode = (uint8_t)constrain(webServer.arg("cosMode").toInt(), 0, 2);
   cfg.data.cosInvert = webServer.hasArg("cosInvert");
   cfg.data.dspSquelchThresh = (uint8_t)constrain(webServer.arg("dspSquelch").toInt(), 0, 255);
@@ -355,6 +419,8 @@ static void handleRadioPost() {
   cfg.data.dspSqlHyst = (uint8_t)constrain(webServer.arg("dspSqlHyst").toInt(), 0, 60);
   float calib = webServer.arg("dspCalib").toFloat();
   cfg.data.dspCalib = (calib < 1.0f) ? 1.0f : calib;
+  cfg.data.dspBewMode = (uint8_t)constrain(webServer.arg("dspBew").toInt(), 0, 3);
+  cfg.data.dspNarrowBand = webServer.arg("dspBand").toInt() == 1;
   cfg.data.useHwRSSI = webServer.hasArg("useHwRssi");
   cfg.data.rssiMin = (uint16_t)constrain(webServer.arg("rssiMin").toInt(), 0, 4095);
   cfg.data.rssiMax = (uint16_t)constrain(webServer.arg("rssiMax").toInt(), 0, 4095);
@@ -367,8 +433,11 @@ static void handleRadioPost() {
   cfg.data.enableDeemp = webServer.hasArg("deemp");
   cfg.data.enablePLFilter = webServer.hasArg("plFilter");
   cfg.save();
-  scheduleReboot();
-  sendRedirectToRebooting();
+  applyRadioConfig();
+  if (cfg.data.jitterMs != oldJitterMs)
+    voter.jitterBuffer.setLatency(cfg.data.jitterMs); // flushes the buffer
+  webServer.sendHeader("Location", "/radio", true);
+  webServer.send(303, "text/plain", "");
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +446,8 @@ static void handleRadioPost() {
 static void handleNetwork() {
   String html = htmlHeader("Network");
   html += "<div class=\"card\"><h2>Interface</h2><form method=\"POST\" action=\"/network\">";
+  html += "<label>Hostname (this device on the network: DHCP and WiFi name; letters, digits, hyphens):</label>"
+          "<input type=\"text\" name=\"devHost\" maxlength=\"31\" value=\"" + htmlEscape(cfg.data.deviceHostname) + "\">";
   html += "<label>Connect using:</label><select name=\"netIface\">";
   html += String("<option value=\"0\"") + (cfg.data.netIface == NET_IFACE_AUTO ? " selected" : "") +
           ">Auto - Ethernet when a cable is connected, otherwise WiFi</option>";
@@ -399,8 +470,28 @@ static void handleNetwork() {
   webServer.send(200, "text/html", html);
 }
 
+// DHCP / DNS name rules (RFC 1123 label): a-z 0-9 and '-', not starting or
+// ending with '-'. Anything else becomes '-'; empty falls back to the default.
+static void cleanHostname(String in, char *out, size_t len) {
+  in.trim();
+  in.toLowerCase();
+  String h;
+  for (size_t i = 0; i < in.length() && h.length() < len - 1; i++) {
+    char c = in[i];
+    bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    if (ok)
+      h += c;
+    else if (h.length() && h[h.length() - 1] != '-')
+      h += '-';
+  }
+  while (h.length() && h[h.length() - 1] == '-')
+    h.remove(h.length() - 1);
+  strlcpy(out, h.length() ? h.c_str() : DEF_DEVICE_HOSTNAME, len);
+}
+
 static void handleNetworkPost() {
   cfg.data.netIface = (uint8_t)constrain(webServer.arg("netIface").toInt(), NET_IFACE_AUTO, NET_IFACE_WIFI);
+  cleanHostname(webServer.arg("devHost"), cfg.data.deviceHostname, sizeof(cfg.data.deviceHostname));
   cfg.data.useStaticIP = webServer.hasArg("useStaticIP");
   IPAddress ip;
   if (ip.fromString(webServer.arg("staticIP")))
@@ -670,17 +761,17 @@ static void handleRepeater() {
   html += "<form method=\"POST\" action=\"/repeater\">";
   html += checkbox("enable", r.enable, "Enable offline repeater failover");
   html += "<label>Take over after the host is not connected for (s):</label><input type=\"number\" name=\"trigger\" min=\"5\" max=\"3600\" value=\"" + String(r.triggerS) + "\">";
+  html += "<label>Startup delay - no takeover until this long after power-up (s):</label><input type=\"number\" name=\"bootDelay\" min=\"0\" max=\"3600\" value=\"" + String(r.bootDelayS) + "\">";
   html += "<label>Hang time after the input drops (ms):</label><input type=\"number\" name=\"hang\" min=\"0\" max=\"10000\" value=\"" + String(r.hangMs) + "\">";
   html += "<label>Timeout timer (s, 0 = off):</label><input type=\"number\" name=\"tot\" min=\"0\" max=\"1800\" value=\"" + String(r.totS) + "\">";
   html += "<label>Repeated audio level (%, 100 = unity):</label><input type=\"number\" name=\"gain\" min=\"0\" max=\"255\" value=\"" + String(r.gainPct) + "\">";
   html += "<p>The overall TX level is still set by TX Gain on the Radio page. The PL Filter setting there also applies to repeated audio.</p>";
   html += checkbox("deemp", r.deemp, "De-emphasize repeated audio (only if the TX audio input pre-emphasizes - flat in, flat out otherwise)");
-  html += checkbox("courtesy", r.courtesy, "Courtesy tone after each transmission");
+  html += checkbox("courtesy", r.courtesy, "Courtesy tone (Morse F, at the ID speed) after each transmission");
   html += "<label>Courtesy tone frequency (Hz):</label><input type=\"number\" name=\"beepHz\" min=\"300\" max=\"3000\" value=\"" + String(r.beepHz) + "\">";
-  html += "<label>Courtesy tone length (ms):</label><input type=\"number\" name=\"beepMs\" min=\"20\" max=\"1000\" value=\"" + String(r.beepMs) + "\">";
   html += "<h2>CW ID</h2>";
-  html += "<p>Sent after the first transmission, then whenever there has been activity and 10 minutes have "
-          "passed since the last ID (FCC 97.119). Waits for a gap; sent over the audio if still pending after a minute.</p>";
+  html += "<p>Sent as soon as the offline repeater takes over, then whenever there has been activity and 10 minutes "
+          "have passed since the last ID (FCC 97.119). Waits for a gap; sent over the audio if still pending after a minute.</p>";
   html += "<label>ID callsign (required):</label><input type=\"text\" name=\"call\" maxlength=\"15\" value=\"" + htmlEscape(r.idCall) + "\">";
   html += "<label>Speed (WPM):</label><input type=\"number\" name=\"wpm\" min=\"5\" max=\"40\" value=\"" + String(r.idWpm) + "\">";
   html += "<label>Tone (Hz):</label><input type=\"number\" name=\"freq\" min=\"300\" max=\"2000\" value=\"" + String(r.idFreqHz) + "\">";
@@ -699,18 +790,218 @@ static void handleRepeaterPost() {
   bool wantEnable = webServer.hasArg("enable");
   r.enable = wantEnable && r.idCall[0] != '\0';
   r.triggerS = (uint16_t)constrain(webServer.arg("trigger").toInt(), 5, 3600);
+  r.bootDelayS = (uint16_t)constrain(webServer.arg("bootDelay").toInt(), 0, 3600);
   r.hangMs = (uint16_t)constrain(webServer.arg("hang").toInt(), 0, 10000);
   r.totS = (uint16_t)constrain(webServer.arg("tot").toInt(), 0, 1800);
   r.gainPct = (uint8_t)constrain(webServer.arg("gain").toInt(), 0, 255);
   r.deemp = webServer.hasArg("deemp");
   r.courtesy = webServer.hasArg("courtesy");
   r.beepHz = (uint16_t)constrain(webServer.arg("beepHz").toInt(), 300, 3000);
-  r.beepMs = (uint16_t)constrain(webServer.arg("beepMs").toInt(), 20, 1000);
   r.idWpm = (uint8_t)constrain(webServer.arg("wpm").toInt(), 5, 40);
   r.idFreqHz = (uint16_t)constrain(webServer.arg("freq").toInt(), 300, 2000);
   r.idLevelPct = (uint8_t)constrain(webServer.arg("level").toInt(), 1, 100);
   cfg.saveRpt();
   webServer.sendHeader("Location", (wantEnable && !r.enable) ? "/repeater?nocall=1" : "/repeater?saved=1", true);
+  webServer.send(302, "text/plain", "");
+}
+
+// ---------------------------------------------------------------------------
+// WireGuard remote access. The private key is never sent to the browser:
+// a blank field keeps the stored key.
+// ---------------------------------------------------------------------------
+static const char *wgErrText(int e) {
+  switch (e) {
+  case 1:
+    return "Private key is not a valid WireGuard key (44 base64 characters)";
+  case 2:
+    return "Server public key is not a valid WireGuard key (44 base64 characters)";
+  case 3:
+    return "Preshared key is not a valid WireGuard key (44 base64 characters)";
+  case 4:
+    return "Enter the server endpoint (hostname or IP)";
+  case 5:
+    return "Enter a valid tunnel address and netmask";
+  case 6:
+    return "No private key yet - generate one or paste one";
+  case 7:
+    return "Remote subnets: use network/prefix, e.g. 10.10.10.0/23, up to 4, comma separated";
+  }
+  return "Invalid setting";
+}
+
+static int maskToPrefix(uint32_t maskNet) {
+  uint32_t m = ntohl(maskNet);
+  int n = 0;
+  while (m & 0x80000000u) {
+    n++;
+    m <<= 1;
+  }
+  return n;
+}
+
+// "10.10.10.0/23, 192.168.5.0/24" -> networks + masks (network byte order)
+static bool parseRoutes(String s, WgConfig &w) {
+  w.nRoutes = 0;
+  s.replace(' ', ',');
+  int pos = 0;
+  while (pos < (int)s.length()) {
+    int comma = s.indexOf(',', pos);
+    if (comma < 0)
+      comma = s.length();
+    String item = s.substring(pos, comma);
+    item.trim();
+    pos = comma + 1;
+    if (item.length() == 0)
+      continue;
+    int slash = item.indexOf('/');
+    if (slash < 0 || w.nRoutes >= WG_MAX_ROUTES)
+      return false;
+    IPAddress ip;
+    if (!ip.fromString(item.substring(0, slash)))
+      return false;
+    long prefix = item.substring(slash + 1).toInt();
+    if (prefix < 1 || prefix > 32)
+      return false;
+    uint32_t mask = htonl(prefix == 32 ? 0xFFFFFFFFu : ~(0xFFFFFFFFu >> prefix));
+    w.routeNet[w.nRoutes] = (uint32_t)ip & mask;
+    w.routeMask[w.nRoutes] = mask;
+    w.nRoutes++;
+  }
+  return true;
+}
+
+static String routesText(const WgConfig &w) {
+  String out;
+  for (uint8_t i = 0; i < w.nRoutes && i < WG_MAX_ROUTES; i++) {
+    if (out.length())
+      out += ", ";
+    out += IPAddress(w.routeNet[i]).toString() + "/" + String(maskToPrefix(w.routeMask[i]));
+  }
+  return out;
+}
+
+static void handleWg() {
+  const WgConfig &w = cfg.wg;
+  String html = htmlHeader("WireGuard");
+  if (webServer.hasArg("err"))
+    html += String("<div class=\"card\"><span class=\"status warn\">Not saved: ") +
+            wgErrText(webServer.arg("err").toInt()) + "</span></div>";
+  if (webServer.hasArg("newkey"))
+    html += "<div class=\"card\"><span class=\"status ok\">New key pair generated and saved</span> "
+            "Copy the public key below to the server's peer entry, then Save &amp; Reboot here.</div>";
+
+  char state[192];
+  wgTunnel.statusText(state, sizeof(state));
+  char pub[WG_KEY_B64_LEN + 4] = "";
+  bool havePriv = WgTunnel::publicFromPrivate(w.privateKey, pub, sizeof(pub));
+
+  html += "<div class=\"card\"><h2>WireGuard Remote Access</h2><table>";
+  html += "<tr><td>Tunnel</td><td>" + htmlEscape(state) + "</td></tr>";
+  html += String("<tr><td>This device's public key</td><td><code>") +
+          (havePriv ? pub : "(no private key yet)") + "</code></td></tr></table>";
+  html += "<p>Split tunnel: only the tunnel subnet and the remote subnets below go through WireGuard. "
+          "Everything else stays on Ethernet/WiFi.</p>";
+  html += "<form method=\"POST\" action=\"/wireguard/genkey\" onsubmit=\"return confirm('Replace the private key? "
+          "The server will need the new public key.')\">"
+          "<input type=\"submit\" value=\"Generate new key pair\" class=\"btn\"></form></div>";
+
+  html += "<div class=\"card\"><h2>Settings</h2><form method=\"POST\" action=\"/wireguard\">";
+  html += checkbox("enable", w.enable, "Enable WireGuard");
+  html += "<label>Private key (this device, base64). Leave blank to keep the stored key:</label>"
+          "<input type=\"password\" id=\"wgPriv\" name=\"priv\" maxlength=\"44\" autocomplete=\"off\" placeholder=\"" +
+          String(havePriv ? "(stored - unchanged)" : "(none)") + "\">";
+  html += "<label><input type=\"checkbox\" onclick=\"toggleShow('wgPriv')\"> Show</label>";
+  html += "<label>Server public key:</label>"
+          "<input type=\"text\" name=\"peer\" maxlength=\"44\" value=\"" + htmlEscape(w.peerPublicKey) + "\">";
+  html += "<label>Preshared key (optional). Leave blank to keep:</label>"
+          "<input type=\"password\" id=\"wgPsk\" name=\"psk\" maxlength=\"44\" autocomplete=\"off\" placeholder=\"" +
+          String(w.presharedKey[0] ? "(stored - unchanged)" : "(none)") + "\">";
+  html += "<label><input type=\"checkbox\" onclick=\"toggleShow('wgPsk')\"> Show</label>";
+  html += checkbox("pskClear", false, "Remove the stored preshared key");
+  html += "<label>Server endpoint (public hostname or IP):</label>"
+          "<input type=\"text\" name=\"endpoint\" maxlength=\"63\" value=\"" + htmlEscape(w.endpoint) + "\">";
+  html += "<label>Server port:</label><input type=\"number\" name=\"port\" min=\"1\" max=\"65535\" value=\"" +
+          String(w.endpointPort) + "\">";
+  html += "<label>Tunnel address (this device):</label><input type=\"text\" name=\"addr\" value=\"" +
+          (w.address ? IPAddress(w.address).toString() : String("")) + "\">";
+  html += "<label>Tunnel netmask:</label><input type=\"text\" name=\"mask\" value=\"" +
+          IPAddress(w.netmask).toString() + "\">";
+  html += "<label>Remote subnets through the tunnel (network/prefix, comma separated, up to 4 - e.g. the LAN "
+          "behind the server):</label><input type=\"text\" name=\"routes\" placeholder=\"example: 192.168.1.0/24\" value=\"" +
+          routesText(w) + "\">";
+  html += "<p>Routed through the tunnel: the tunnel subnet plus these. A subnet this device is directly on "
+          "always stays local. Anything in these subnets, including the voter host if it is in one, goes "
+          "through the tunnel while it is up.</p>";
+  html += "<label>Persistent keepalive (s, 0 = off; keep on behind NAT):</label>"
+          "<input type=\"number\" name=\"keepalive\" min=\"0\" max=\"600\" value=\"" + String(w.keepaliveS) + "\">";
+  html += "<input type=\"submit\" value=\"Save &amp; Reboot\" class=\"btn\"></form></div>";
+  html += htmlFooter();
+  webServer.send(200, "text/html", html);
+}
+
+static void wgRedirectErr(int e) {
+  webServer.sendHeader("Location", "/wireguard?err=" + String(e), true);
+  webServer.send(302, "text/plain", "");
+}
+
+static void handleWgPost() {
+  WgConfig w = cfg.wg;
+  w.enable = webServer.hasArg("enable");
+
+  String priv = webServer.arg("priv");
+  priv.trim();
+  if (priv.length()) {
+    if (!WgTunnel::validKey(priv.c_str()))
+      return wgRedirectErr(1);
+    strlcpy(w.privateKey, priv.c_str(), sizeof(w.privateKey));
+  }
+  String peer = webServer.arg("peer");
+  peer.trim();
+  if (peer.length() && !WgTunnel::validKey(peer.c_str()))
+    return wgRedirectErr(2);
+  strlcpy(w.peerPublicKey, peer.c_str(), sizeof(w.peerPublicKey));
+  String psk = webServer.arg("psk");
+  psk.trim();
+  if (webServer.hasArg("pskClear")) {
+    w.presharedKey[0] = '\0';
+  } else if (psk.length()) {
+    if (!WgTunnel::validKey(psk.c_str()))
+      return wgRedirectErr(3);
+    strlcpy(w.presharedKey, psk.c_str(), sizeof(w.presharedKey));
+  }
+  String ep = webServer.arg("endpoint");
+  ep.trim();
+  strlcpy(w.endpoint, ep.c_str(), sizeof(w.endpoint));
+  w.endpointPort = (uint16_t)constrain(webServer.arg("port").toInt(), 1, 65535);
+  IPAddress ip;
+  w.address = ip.fromString(webServer.arg("addr")) ? (uint32_t)ip : 0;
+  w.netmask = ip.fromString(webServer.arg("mask")) ? (uint32_t)ip : 0;
+  w.keepaliveS = (uint16_t)constrain(webServer.arg("keepalive").toInt(), 0, 600);
+  if (!parseRoutes(webServer.arg("routes"), w))
+    return wgRedirectErr(7);
+
+  // Only an enabled tunnel has to be complete
+  if (w.enable) {
+    if (!WgTunnel::validKey(w.privateKey))
+      return wgRedirectErr(6);
+    if (!WgTunnel::validKey(w.peerPublicKey))
+      return wgRedirectErr(2);
+    if (w.endpoint[0] == '\0')
+      return wgRedirectErr(4);
+    if (w.address == 0 || w.netmask == 0)
+      return wgRedirectErr(5);
+  }
+  cfg.wg = w;
+  cfg.saveWg();
+  scheduleReboot();
+  sendRedirectToRebooting();
+}
+
+static void handleWgGenKey() {
+  WgTunnel::newPrivateKey(cfg.wg.privateKey, sizeof(cfg.wg.privateKey));
+  cfg.saveWg(); // takes effect at the next reboot (Save & Reboot)
+  logger.info("WG", "New key pair generated");
+  webServer.sendHeader("Location", "/wireguard?newkey=1", true);
   webServer.send(302, "text/plain", "");
 }
 
@@ -741,8 +1032,76 @@ static void handleGps() {
     html += "<p>Saved position: none. A survey runs when timing mode is enabled.</p>";
   }
   html += "<input type=\"submit\" value=\"Save &amp; Reboot\" class=\"btn\"></form></div>";
+
+  // Start-up aiding position
+  const GpsAidConfig &a = cfg.gpsAid;
+  html += "<div class=\"card\"><h2>GPS Start-up Aiding</h2><form method=\"POST\" action=\"/gps/aid\">";
+  html += "<p>At boot the GPS is given the network (NTP) time and this position so it searches for the "
+          "right satellites. If no satellites are used for 5 minutes it is cold started (then at most every 20 minutes). "
+          "Within a few km is plenty. Blank = use the survey position, if any.</p>";
+  html += "<label>Latitude (decimal degrees):</label><input type=\"text\" name=\"lat\" placeholder=\"example: 32.7767\" value=\"" +
+          (a.set ? String(a.latE7 / 1e7, 7) : String("")) + "\">";
+  html += "<label>Longitude (decimal degrees, west negative):</label><input type=\"text\" name=\"lon\" placeholder=\"example: -96.7970\" value=\"" +
+          (a.set ? String(a.lonE7 / 1e7, 7) : String("")) + "\">";
+  html += "<label>Height (m):</label><input type=\"text\" name=\"alt\" placeholder=\"example: 150\" value=\"" +
+          (a.set ? String(a.altCm / 100.0, 1) : String("")) + "\">";
+  double clat, clon, calt;
+  if (gps.getCurrentPosition(&clat, &clon, &calt)) {
+    html += "<p>Current GPS position: " + String(clat, 7) + ", " + String(clon, 7) + ", height " + String(calt, 1) + " m</p>";
+  } else {
+    html += "<p>Current GPS position: no fix.</p>";
+  }
+  char aid[128];
+  gps.aidSummary(aid, sizeof(aid));
+  html += String("<p>") + aid + "</p>";
+  html += "<input type=\"submit\" name=\"save\" value=\"Save\" class=\"btn\"> "
+          "<input type=\"submit\" name=\"usefix\" value=\"Use current GPS position\" class=\"btn\"></form>";
+  html += "<form method=\"POST\" action=\"/gps/cold\" onsubmit=\"return confirm('Cold start the GPS? It erases its almanac, "
+          "ephemeris, position and time. GPS lock is lost until it gets a new fix.')\">"
+          "<input type=\"submit\" value=\"Cold start GPS\" class=\"btn\"></form></div>";
   html += htmlFooter();
   webServer.send(200, "text/html", html);
+}
+
+static void handleGpsAidPost() {
+  GpsAidConfig &a = cfg.gpsAid;
+  double lat, lon, alt;
+  bool ok;
+  if (webServer.hasArg("usefix")) {
+    ok = gps.getCurrentPosition(&lat, &lon, &alt);
+  } else {
+    String sLat = webServer.arg("lat"), sLon = webServer.arg("lon"), sAlt = webServer.arg("alt");
+    sLat.trim();
+    sLon.trim();
+    sAlt.trim();
+    if (sLat.length() == 0 && sLon.length() == 0) {
+      a.set = false; // blank = clear
+      ok = false;
+    } else {
+      lat = atof(sLat.c_str());
+      lon = atof(sLon.c_str());
+      alt = atof(sAlt.c_str());
+      ok = sLat.length() && sLon.length() && fabs(lat) <= 90.0 && fabs(lon) <= 180.0;
+    }
+  }
+  if (ok) {
+    a.set = true;
+    a.latE7 = (int32_t)lround(lat * 1e7);
+    a.lonE7 = (int32_t)lround(lon * 1e7);
+    a.altCm = (int32_t)lround(constrain(alt, -1000.0, 9000.0) * 100.0);
+  }
+  if (ok || !a.set) {
+    cfg.saveGpsAid();
+    gps.requestAid(); // sent now if the GPS has no satellites yet
+  }
+  webServer.sendHeader("Location", "/gps", true);
+  webServer.send(303, "text/plain", "");
+}
+
+static void handleGpsColdPost() {
+  gps.coldStart();
+  webServer.sendHeader("Location", "/gps", true);
+  webServer.send(303, "text/plain", "");
 }
 
 static void handleGpsPost() {
@@ -837,6 +1196,8 @@ void webBegin() {
   webServer.on("/voter", HTTP_POST, handleVoterPost);
   webServer.on("/radio", HTTP_GET, handleRadio);
   webServer.on("/radio", HTTP_POST, handleRadioPost);
+  webServer.on("/tone", HTTP_GET, handleTone);
+  webServer.on("/tone", HTTP_POST, handleTonePost);
   webServer.on("/network", HTTP_GET, handleNetwork);
   webServer.on("/network", HTTP_POST, handleNetworkPost);
   webServer.on("/wifi", HTTP_GET, handleWiFi);
@@ -850,8 +1211,13 @@ void webBegin() {
   webServer.on("/rssical/save", HTTP_POST, handleRssiCalSave);
   webServer.on("/repeater", HTTP_GET, handleRepeater);
   webServer.on("/repeater", HTTP_POST, handleRepeaterPost);
+  webServer.on("/wireguard", HTTP_GET, handleWg);
+  webServer.on("/wireguard", HTTP_POST, handleWgPost);
+  webServer.on("/wireguard/genkey", HTTP_POST, handleWgGenKey);
   webServer.on("/gps", HTTP_GET, handleGps);
   webServer.on("/gps", HTTP_POST, handleGpsPost);
+  webServer.on("/gps/aid", HTTP_POST, handleGpsAidPost);
+  webServer.on("/gps/cold", HTTP_POST, handleGpsColdPost);
   webServer.on("/update", HTTP_GET, handleUpdate);
   webServer.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
 

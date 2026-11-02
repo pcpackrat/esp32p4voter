@@ -79,6 +79,13 @@ void NetManager::begin() {
     }
   });
 
+  // Device name for DHCP / WiFi. WiFi takes it from here when it starts;
+  // Ethernet is set in _startEth().
+  if (cfg.data.deviceHostname[0] != '\0') {
+    Network.setHostname(cfg.data.deviceHostname);
+    Serial.printf("[NET] Hostname: %s\r\n", cfg.data.deviceHostname);
+  }
+
   static const char *ifaceNames[] = {"Auto (Ethernet when cabled, else WiFi)", "Ethernet only", "WiFi only"};
   Serial.printf("[NET] Interface: %s\r\n", ifaceNames[cfg.data.netIface <= NET_IFACE_WIFI ? cfg.data.netIface : 0]);
 
@@ -125,6 +132,9 @@ void NetManager::_startEth() {
   // PHY) use the Arduino esp32p4 variant defaults, which match this board.
   ETH.begin(ETH_PHY_IP101, ETH_PHY_ADDR_IP101, ETH_PHY_MDC_PIN, ETH_PHY_MDIO_PIN,
             ETH_PHY_RESET_PIN, EMAC_CLK_EXT_IN);
+  // Before the link comes up, so the first DHCP request carries the name
+  if (cfg.data.deviceHostname[0] != '\0')
+    ETH.setHostname(cfg.data.deviceHostname);
 
   if (cfg.data.useStaticIP) {
     ETH.config(IPAddress(cfg.data.staticIP), IPAddress(cfg.data.gateway),

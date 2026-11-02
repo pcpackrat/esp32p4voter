@@ -34,7 +34,9 @@ void Logger::_add(LogLevel level, const char *tag, const char *msg) {
     lvlStr = "WARN";
   if (level == LOG_ERR)
     lvlStr = "ERROR";
-  Serial.printf("[LOG][%s][%s] %s\r\n", lvlStr, tag, msg);
+  uint32_t ms = millis(); // uptime: works before GPS or NTP time is known
+  Serial.printf("[%lu.%03lu][LOG][%s][%s] %s\r\n", (unsigned long)(ms / 1000), (unsigned long)(ms % 1000),
+                lvlStr, tag, msg);
 }
 
 void Logger::log(LogLevel level, const char *tag, const char *fmt, ...) {

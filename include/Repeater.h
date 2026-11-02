@@ -6,7 +6,8 @@
 
 // Offline repeater: when enabled (cfg.rpt) and the voter host has not been
 // connected for cfg.rpt.triggerS, RX audio is looped straight to TX with PTT
-// on COS + hang time, a timeout timer, courtesy tone and CW ID. Hands back to
+// on COS + hang time, a timeout timer, courtesy tone (Morse F) and CW ID
+// (sent as soon as the repeater takes over, then per FCC 97.119). Hands back to
 // the host when it reconnects, once the current transmission has ended.
 //
 // Threads: update() runs in the loop task; feedRx() in the RX task;
@@ -32,6 +33,7 @@ public:
 private:
   void _setActive(bool on);
   void _startTones(bool id);
+  void _addMorse(const char *text, int32_t dit);
 
   volatile bool _active = false;
   volatile bool _keyed = false;

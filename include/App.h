@@ -14,6 +14,7 @@ struct RxStatus {
   volatile uint8_t noise;           // DSP noise level (0-255)
   volatile uint16_t rssiRaw;        // RSSI pin, raw ADC counts (0-4095)
   volatile float noiseRms;          // DSP noise RMS (Q15), the DSP RSSI input
+  volatile uint8_t rssiHeldPct;     // % of the last second the DSP RSSI was held (voice)
   volatile int16_t adcPeak;         // Max |sample| over last second, before DSP
   volatile int16_t encPeak;         // Max |sample| over last second, after DSP
   volatile uint32_t framesCaptured; // 20ms frames read from the codec
@@ -50,9 +51,23 @@ struct RssiCalMeasure {
 };
 extern RssiCalMeasure g_rssiCal;
 
+// TX test tone, started from the Radio page. The TX task plays it in place of
+// host audio (through TX Gain) and PTT stays keyed until untilMs.
+struct TestTone {
+  volatile uint16_t hz;
+  volatile float amp;       // peak, 16-bit full scale = 32767
+  volatile uint32_t untilMs; // millis() end time, 0 = off
+};
+extern TestTone g_testTone;
+inline bool testToneActive() {
+  uint32_t until = g_testTone.untilMs;
+  return until != 0 && (int32_t)(until - millis()) > 0;
+}
+
 // Map v to RSSI 0-255, linear between the no-signal and full-quieting
 // readings. Works either way round (RSSI voltage or noise falling with signal).
 uint8_t rssiFromCal(float v, float atNoSig, float atFull);
+void applyRadioConfig(); // apply Radio page changes without a reboot
 extern GPSManager gps;
 extern GpsAudio gpsAudio;
 extern VoterClient voter;
