@@ -361,6 +361,20 @@ static void rxTask(void *arg) {
 // -----------------------------------------------------------------------------
 // Network send: frames go out as soon as they are made (not via the main loop)
 // -----------------------------------------------------------------------------
+// Client send phase: age (GPS now - frame start) at which a client sends.
+// A frame is complete at 20 ms; the master sends then. Clients wait until
+// 30 ms so they never reach the host in the same ms as the master's packet.
+// chan_voter places client audio against the newest master time it has, so
+// a client arriving with the master lands in one of two slots 20 ms apart.
+static const double CLIENT_SEND_AGE_MS = 30.0;
+
+static double frameAgeMs(const VTIME &frame) {
+  VTIME now;
+  gps.getNetworkTime(&now, false);
+  return (double)(int32_t)(now.vtime_sec - frame.vtime_sec) * 1000.0 +
+         ((double)now.vtime_nsec - (double)frame.vtime_nsec) / 1e6;
+}
+
 static void netTask(void *arg) {
   AudioFrame f;
   double sum = 0.0, mx = 0.0;
@@ -369,14 +383,16 @@ static void netTask(void *arg) {
   for (;;) {
     if (xQueueReceive(s_frameQueue, &f, portMAX_DELAY) != pdTRUE)
       continue;
+    if (!voter.sendAlways()) {
+      double wait = CLIENT_SEND_AGE_MS - frameAgeMs(f.time);
+      if (wait >= 1.0)
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)wait));
+    }
     voter.processAudioFrame(f.ulaw, f.rssi, f.time);
 
     // Age at send = GPS now - frame start. For a master this is part of every
     // site's TX timing, so it is measured, not assumed.
-    VTIME now;
-    gps.getNetworkTime(&now, false);
-    double age = (double)(int32_t)(now.vtime_sec - f.time.vtime_sec) * 1000.0 +
-                 ((double)now.vtime_nsec - (double)f.time.vtime_nsec) / 1e6;
+    double age = frameAgeMs(f.time);
     sum += age;
     if (age > mx)
       mx = age;
