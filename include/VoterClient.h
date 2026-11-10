@@ -125,6 +125,7 @@ private:
   uint32_t _gpsLostTime;
   uint32_t _authAttempts;
   uint32_t _lastRxTime;
+  uint8_t _authWhileConnected; // host auth replies to our GPS/audio: it doesn't know us
   uint8_t _authMismatchStreak;
   uint32_t _audioFramesSent;
   bool _hasWarnedAuth;

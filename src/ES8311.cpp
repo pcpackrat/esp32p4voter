@@ -80,7 +80,7 @@ bool ES8311::begin(TwoWire *wire, uint8_t addr, uint8_t pgaGain) {
   ok &= _write(0x32, 0xBF); // DAC digital volume 0 dB
   ok &= _write(0x45, 0x00);
 
-  setPgaGain(pgaGain);
+  ok &= setPgaGain(pgaGain);
 
   if (!ok) {
     Serial.println("[ES8311] Register write failed during init");
@@ -91,9 +91,14 @@ bool ES8311::begin(TwoWire *wire, uint8_t addr, uint8_t pgaGain) {
   return true;
 }
 
-void ES8311::setPgaGain(uint8_t step) {
+bool ES8311::setPgaGain(uint8_t step) {
+  if (!_wire)
+    return false;
   if (step > 10)
     step = 10;
   // REG14: bit4 = select MIC1P/MIC1N input, bits[3:0] = PGA gain
-  _write(0x14, 0x10 | step);
+  uint8_t val = 0x10 | step;
+  if (!_write(0x14, val))
+    return false;
+  return _read(0x14) == val;
 }

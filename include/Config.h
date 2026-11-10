@@ -161,6 +161,17 @@ struct WgConfig {
   uint32_t routeMask[WG_MAX_ROUTES];
 };
 
+// Saved WiFi networks. Network 1 is SysConfig wifiSSID / wifiPass (older
+// configs, backups and Site.h defaults keep working); networks 2-5 and the
+// selection live here, under their own NVS key.
+#define WIFI_MAX_NETS 5
+#define WIFI_PIN_AUTO 0xFF // connect to the strongest saved network in range
+struct WifiNetsConfig {
+  uint8_t pinned; // WIFI_PIN_AUTO, or network index 0-4
+  char ssid[WIFI_MAX_NETS - 1][33];
+  char pass[WIFI_MAX_NETS - 1][65];
+};
+
 class ConfigManager {
 public:
   void begin();
@@ -170,6 +181,13 @@ public:
   void saveGpsAid();
   void saveRpt();
   void saveWg();
+  void saveWifiNets();
+
+  // Saved WiFi network i (0 = network 1, in SysConfig)
+  const char *wifiSsid(int i) const;
+  const char *wifiPass(int i) const;
+  void setWifi(int i, const char *ssid, const char *pass);
+  int wifiCount() const; // networks with an SSID
 
   IPAddress hostIP() const { return IPAddress(data.hostIP); }
 
@@ -178,11 +196,13 @@ public:
   GpsAidConfig gpsAid;
   RptConfig rpt;
   WgConfig wg;
+  WifiNetsConfig wifiNets;
 
 private:
   void _gpsTimingDefaults();
   void _rptDefaults();
   void _wgDefaults();
+  void _wifiNetsDefaults();
 };
 
 extern ConfigManager cfg;

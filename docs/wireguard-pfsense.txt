@@ -1,0 +1,7 @@
+pfSense setup
+VPN → WireGuard → Tunnels: note the tunnel's public key, listen port and address (e.g. 10.99.0.1/24). Enter the public key and port above, and the pfSense public hostname/IP as the endpoint.
+Peers → Add, on that tunnel: public key = this device's public key (above). Allowed IPs = this device's tunnel address /32 (e.g. 10.99.0.2/32). No endpoint needed (dynamic). Add the same preshared key if you use one.
+Tunnel address above: a free address in the tunnel subnet (e.g. 10.99.0.2), netmask to match (e.g. 255.255.255.0). The subnet must not overlap any LAN this device uses.
+Firewall → Rules on the WireGuard interface: allow traffic to the device (TCP 80).
+Browsing from a client that is itself a WireGuard peer in the tunnel subnet works as-is. From a LAN behind the pfSense, add an outbound NAT rule on the WireGuard interface so that traffic appears to come from the tunnel subnet - the device only answers tunnel-subnet addresses through the tunnel.
+Open http://<tunnel address>/ from the remote side. The Network card on the Status page shows the tunnel state and last handshake.

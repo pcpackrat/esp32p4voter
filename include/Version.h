@@ -3,6 +3,8 @@
 
 #define FIRMWARE_NAME "ESP32-P4 Voter"
 #define FIRMWARE_VERSION "0.1.0"
+// Device type in exported settings files; import refuses a different type
+#define DEVICE_TYPE "p4"
 
 // BUILD_TIMESTAMP is injected by build_timestamp.py on every build.
 #ifdef BUILD_TIMESTAMP

@@ -73,6 +73,11 @@ void ConfigManager::begin() {
     prefs.getBytes("rpt", &rpt, rptLen);
   }
 
+  _wifiNetsDefaults();
+  size_t wnLen = prefs.getBytesLength("wifi");
+  if (wnLen > 0 && wnLen <= sizeof(wifiNets)) {
+    prefs.getBytes("wifi", &wifiNets, wnLen);
+  }
   _wgDefaults();
   size_t wgLen = prefs.getBytesLength("wg");
   if (wgLen > 0 && wgLen <= sizeof(wg)) {
@@ -209,4 +214,48 @@ void ConfigManager::resetDefaults() {
   _wgDefaults();
   saveWg();
   Serial.println("[Config] Reset to defaults");
+}
+
+void ConfigManager::saveWifiNets() {
+  prefs.putBytes("wifi", &wifiNets, sizeof(wifiNets));
+  Serial.println("[Config] WiFi networks saved to NVS");
+}
+
+void ConfigManager::_wifiNetsDefaults() {
+  memset(&wifiNets, 0, sizeof(wifiNets));
+  wifiNets.pinned = WIFI_PIN_AUTO;
+}
+
+const char *ConfigManager::wifiSsid(int i) const {
+  if (i == 0)
+    return data.wifiSSID;
+  if (i > 0 && i < WIFI_MAX_NETS)
+    return wifiNets.ssid[i - 1];
+  return "";
+}
+
+const char *ConfigManager::wifiPass(int i) const {
+  if (i == 0)
+    return data.wifiPass;
+  if (i > 0 && i < WIFI_MAX_NETS)
+    return wifiNets.pass[i - 1];
+  return "";
+}
+
+void ConfigManager::setWifi(int i, const char *ssid, const char *pass) {
+  if (i == 0) {
+    strlcpy(data.wifiSSID, ssid, sizeof(data.wifiSSID));
+    strlcpy(data.wifiPass, pass, sizeof(data.wifiPass));
+  } else if (i > 0 && i < WIFI_MAX_NETS) {
+    strlcpy(wifiNets.ssid[i - 1], ssid, sizeof(wifiNets.ssid[0]));
+    strlcpy(wifiNets.pass[i - 1], pass, sizeof(wifiNets.pass[0]));
+  }
+}
+
+int ConfigManager::wifiCount() const {
+  int n = 0;
+  for (int i = 0; i < WIFI_MAX_NETS; i++)
+    if (wifiSsid(i)[0])
+      n++;
+  return n;
 }

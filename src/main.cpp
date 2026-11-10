@@ -47,6 +47,7 @@ volatile uint32_t g_rebootAt = 0;
 static DSPProcessor dsp;
 static AudioCodec codecIo;
 static ES8311 codec;
+uint32_t g_adcOverruns() { return codecIo.rxOverflows(); }
 
 struct AudioFrame {
   uint8_t ulaw[AUDIO_FRAME_SAMPLES];
@@ -620,10 +621,11 @@ static void printStatus() {
                 (unsigned)g_status.rssiRaw);
   Serial.printf(" Peaks   : ADC %d, encoder %d (uLaw clip %d), TX %d\r\n", g_status.adcPeak,
                 g_status.encPeak, ULAW_CLIP_LEVEL, g_status.txPeak);
-  Serial.printf(" Frames  : captured %lu, queued %lu, dropped %lu, played %lu, I2S rd/wr err %lu/%lu\r\n",
+  Serial.printf(" Frames  : captured %lu, queued %lu, dropped %lu, played %lu, I2S rd/wr err %lu/%lu, overruns %lu\r\n",
                 (unsigned long)g_status.framesCaptured, (unsigned long)g_status.framesQueued,
                 (unsigned long)g_status.framesDropped, (unsigned long)g_status.framesPlayed,
-                (unsigned long)g_status.readErrors, (unsigned long)g_status.writeErrors);
+                (unsigned long)g_status.readErrors, (unsigned long)g_status.writeErrors,
+                (unsigned long)codecIo.rxOverflows());
   Serial.printf(" TX      : PTT %s, jitter buffer %u bytes%s\r\n", g_status.ptt ? "KEYED" : "off",
                 (unsigned)voter.jitterBuffer.available(),
                 voter.jitterBuffer.isBuffering() ? " (buffering)" : "");
@@ -690,8 +692,11 @@ static void handleSerial() {
 
 // Radio page settings held outside cfg; everything else on that page is read live
 void applyRadioConfig() {
-  if (g_status.codecOk)
-    codec.setPgaGain(cfg.data.rxPgaGain);
+  // Applied even when init reported a failed write: the chip still answers,
+  // and skipping it left PGA changes ignored until the next boot.
+  bool pgaOk = codec.setPgaGain(cfg.data.rxPgaGain);
+  Serial.printf("[ES8311] PGA %u dB %s\r\n", (unsigned)(cfg.data.rxPgaGain * 3),
+                pgaOk ? "set" : "write FAILED (REG14 readback mismatch)");
   dsp.setRxDigitalGainPct(cfg.data.rxDigitalGainPct);
   dsp.setCalib(cfg.data.dspCalib);
   dsp.setNarrowNoiseBand(cfg.data.dspNarrowBand);

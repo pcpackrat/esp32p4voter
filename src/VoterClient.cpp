@@ -65,6 +65,7 @@ VoterClient::VoterClient() {
   _gpsLostTime = 0;
   _authAttempts = 0;
   _lastRxTime = 0;
+  _authWhileConnected = 0;
   _authMismatchStreak = 0;
   _audioFramesSent = 0;
   _hasWarnedAuth = false;
@@ -410,8 +411,25 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
       _state = VOTER_AUTHENTICATING;
     }
 
-    // A matching digest is sufficient to be connected (matches PIC/STM32
-    // reference) - but never without GPS lock.
+    // A matching digest only proves the HOST password: chan_voter answers an
+    // unknown client (bad client password) with a valid digest too. Once
+    // connected, a client the host knows gets no auth replies to its GPS /
+    // audio packets; an unknown one gets one for every packet. (Connecting
+    // can't wait for a keepalive: with a master configured, the host sends
+    // keepalives only while the master's audio is arriving.)
+    if (_state == VOTER_CONNECTED) {
+      if (type != PAYLOAD_AUTH) {
+        _authWhileConnected = 0;
+      } else if (++_authWhileConnected >= 3) {
+        _state = VOTER_AUTH_ERROR;
+        _authError = AUTH_ERR_CLIENT_REJECTED;
+        Serial.println("[Voter] WARNING: Client Password rejected by Host! (host answers with auth only)");
+        logger.error("VOTER", "Client password rejected by host");
+        return;
+      }
+    }
+
+    // Connect on the match - but never without GPS lock.
     if (_state != VOTER_CONNECTED) {
       if (!_timingReady()) {
         return;
@@ -420,6 +438,7 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
       _state = VOTER_CONNECTED;
       _authError = AUTH_ERR_NONE;
       _authAttempts = 0;
+      _authWhileConnected = 0;
       _lastGPSSend = millis();
       logger.info("VOTER", "Connected to Host %s:%u", _hostIP.toString().c_str(), _hostPort);
     }

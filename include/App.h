@@ -72,6 +72,7 @@ extern GPSManager gps;
 extern GpsAudio gpsAudio;
 extern VoterClient voter;
 extern volatile uint32_t g_rebootAt; // millis() to restart at, 0 = none
+uint32_t g_adcOverruns();
 
 // uLaw encoder clips at this magnitude (13-bit, see DSPProcessor.cpp)
 #define ULAW_CLIP_LEVEL 8159

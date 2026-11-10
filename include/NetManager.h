@@ -22,6 +22,7 @@ public:
   IPAddress localIP() const;
   IPAddress apIP() const { return _apIP; }
   uint32_t apSecondsLeft() const;
+  int wifiNetIndex() const { return _wifiIdx; } // saved network in use / being tried, -1 = none
 
   // Auto mode: switch to WiFi after this long with no cable / no address
   static const uint32_t ETH_LINK_DOWN_FAILOVER_MS = 1000;
@@ -31,6 +32,8 @@ private:
   bool _ethEnabled() const;
   bool _wifiEnabled() const;
   void _wifiConnect();
+  void _wifiBegin(int idx);
+  int _pickWifi(int nScan);
   void _startEth();
   void _startApSetup();
   void _stopApSetup(NetMode nextMode);
@@ -41,6 +44,11 @@ private:
   uint32_t _phyLinkUpSince = 0;
   uint32_t _lastWifiAttempt = 0;
   bool _wifiAttempted = false;
+  int _wifiIdx = -1;          // saved network being tried / connected
+  bool _wifiGotOn = false;    // the current attempt connected at some point
+  uint8_t _wifiFailMask = 0;  // saved networks that failed their last attempt
+  bool _wifiScanning = false; // auto selection: scan running
+  uint32_t _wifiScanStart = 0;
 
   uint32_t _ethReinitCount = 0;
 

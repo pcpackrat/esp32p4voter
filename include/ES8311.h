@@ -13,7 +13,8 @@ public:
   bool begin(TwoWire *wire, uint8_t addr, uint8_t pgaGain);
 
   // ADC PGA gain step 0-10 = 0-30 dB (3 dB steps)
-  void setPgaGain(uint8_t step);
+  // Returns true when REG14 reads back the written value
+  bool setPgaGain(uint8_t step);
 
   uint16_t chipId() const { return _chipId; }
 

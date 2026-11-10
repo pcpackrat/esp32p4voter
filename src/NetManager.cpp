@@ -10,6 +10,7 @@ NetManager net;
 static DNSServer dnsServer;
 
 static const uint32_t WIFI_RETRY_MS = 30000;
+static const uint32_t WIFI_SCAN_TIMEOUT_MS = 10000;
 static const uint32_t ETH_LINK_UP_DEBOUNCE_MS = 500;
 static const uint32_t ETH_FLAP_WINDOW_MS = 20000;
 static const uint8_t ETH_FLAP_THRESHOLD = 5;
@@ -99,23 +100,88 @@ void NetManager::begin() {
 bool NetManager::_ethEnabled() const { return cfg.data.netIface != NET_IFACE_WIFI; }
 
 bool NetManager::_wifiEnabled() const {
-  return cfg.data.netIface != NET_IFACE_ETH && cfg.data.wifiSSID[0] != '\0';
+  return cfg.data.netIface != NET_IFACE_ETH && cfg.wifiCount() > 0;
 }
 
+// Start a WiFi attempt. Pinned network: straight to it. Auto: scan (async,
+// finished in update()), then the strongest saved network in range. A
+// network that failed its last attempt is skipped while another is in range.
 void NetManager::_wifiConnect() {
   _wifiAttempted = true;
   _lastWifiAttempt = millis();
-  Serial.printf("[NET] Connecting WiFi \"%s\" (password %u chars)\r\n", cfg.data.wifiSSID,
-                (unsigned)strlen(cfg.data.wifiPass));
+  if (_wifiIdx >= 0 && !_wifiGotOn)
+    _wifiFailMask |= (uint8_t)(1u << _wifiIdx);
   WiFi.persistent(false); // don't write credentials to NVS on every retry
   // Keep the setup hotspot up while connecting
   WiFi.mode(_mode == NetMode::AP_SETUP ? WIFI_AP_STA : WIFI_STA);
   WiFi.setSleep(false); // modem sleep adds latency/jitter
+
+  uint8_t pin = cfg.wifiNets.pinned;
+  if (pin < WIFI_MAX_NETS && cfg.wifiSsid(pin)[0]) {
+    _wifiBegin(pin);
+    return;
+  }
+  if (cfg.wifiCount() == 1) {
+    for (int i = 0; i < WIFI_MAX_NETS; i++)
+      if (cfg.wifiSsid(i)[0])
+        _wifiBegin(i);
+    return;
+  }
+  WiFi.disconnect(); // a pending connect would hold off the scan
+  WiFi.scanDelete();
+  WiFi.scanNetworks(true);
+  _wifiScanning = true;
+  _wifiScanStart = millis();
+  Serial.println("[NET] Scanning for saved WiFi networks");
+}
+
+int NetManager::_pickWifi(int nScan) {
+  for (int pass = 0; pass < 2; pass++) {
+    int best = -1;
+    int bestRssi = -1000;
+    for (int i = 0; i < WIFI_MAX_NETS; i++) {
+      const char *ssid = cfg.wifiSsid(i);
+      if (!ssid[0] || (_wifiFailMask & (1u << i)))
+        continue;
+      for (int k = 0; k < nScan; k++) {
+        if (WiFi.SSID(k) == ssid && WiFi.RSSI(k) > bestRssi) {
+          best = i;
+          bestRssi = WiFi.RSSI(k);
+        }
+      }
+    }
+    if (best >= 0) {
+      Serial.printf("[NET] Strongest saved network: \"%s\" %d dBm\r\n", cfg.wifiSsid(best), bestRssi);
+      return best;
+    }
+    if (_wifiFailMask == 0)
+      break;
+    _wifiFailMask = 0; // every network in range failed - try them all again
+  }
+  // None in range (or hidden SSIDs): next saved network in turn
+  for (int step = 1; step <= WIFI_MAX_NETS; step++) {
+    int i = (_wifiIdx + step + WIFI_MAX_NETS) % WIFI_MAX_NETS;
+    if (cfg.wifiSsid(i)[0]) {
+      Serial.printf("[NET] No saved network seen in scan - trying \"%s\"\r\n", cfg.wifiSsid(i));
+      return i;
+    }
+  }
+  return -1;
+}
+
+void NetManager::_wifiBegin(int idx) {
+  if (idx < 0)
+    return;
+  _wifiIdx = idx;
+  _wifiGotOn = false;
+  _lastWifiAttempt = millis();
+  Serial.printf("[NET] Connecting WiFi %d/%d \"%s\" (password %u chars)\r\n", idx + 1, WIFI_MAX_NETS,
+                cfg.wifiSsid(idx), (unsigned)strlen(cfg.wifiPass(idx)));
   if (cfg.data.useStaticIP) {
     WiFi.config(IPAddress(cfg.data.staticIP), IPAddress(cfg.data.gateway),
                 IPAddress(cfg.data.subnetMask), IPAddress(cfg.data.staticDNS));
   }
-  WiFi.begin(cfg.data.wifiSSID, cfg.data.wifiPass);
+  WiFi.begin(cfg.wifiSsid(idx), cfg.wifiPass(idx));
 }
 
 void NetManager::_startEth() {
@@ -245,8 +311,20 @@ void NetManager::update() {
         _stopApSetup(NetMode::WIFI_ACTIVE);
       }
       _mode = NetMode::WIFI_ACTIVE;
-      Serial.printf("[NET] WiFi connected: %s, %d dBm\r\n", WiFi.localIP().toString().c_str(),
-                    WiFi.RSSI());
+      _wifiGotOn = true;
+      _wifiFailMask = 0;
+      Serial.printf("[NET] WiFi connected to \"%s\": %s, %d dBm\r\n", WiFi.SSID().c_str(),
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    }
+
+    // Auto selection: scan finished -> connect to the pick
+    if (_wifiScanning) {
+      int n = WiFi.scanComplete();
+      if (n != WIFI_SCAN_RUNNING || millis() - _wifiScanStart > WIFI_SCAN_TIMEOUT_MS) {
+        _wifiScanning = false;
+        _wifiBegin(_pickWifi(n > 0 ? n : 0));
+        WiFi.scanDelete();
+      }
     }
 
     // WiFi starts at boot in WiFi-only mode. In Auto, once Ethernet has no
@@ -254,7 +332,7 @@ void NetManager::update() {
     bool ethGone = !ethOn ||
                    (!phyLinkUp && millis() - _linkDownSince > ETH_LINK_DOWN_FAILOVER_MS) ||
                    (phyLinkUp && millis() - _lastEthUp > ETH_NO_IP_FAILOVER_MS);
-    if (wifiOn && ethGone && (_mode == NetMode::NONE || _mode == NetMode::AP_SETUP) &&
+    if (wifiOn && ethGone && !_wifiScanning && (_mode == NetMode::NONE || _mode == NetMode::AP_SETUP) &&
         (!_wifiAttempted || millis() - _lastWifiAttempt > WIFI_RETRY_MS)) {
       _wifiConnect();
     }
