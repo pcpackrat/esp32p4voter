@@ -363,6 +363,26 @@ void NetManager::update() {
   }
 }
 
+void NetManager::wifiApply(bool reconnect) {
+  if (_mode == NetMode::ETH_ACTIVE)
+    return; // used next time WiFi is needed
+  if (_mode == NetMode::WIFI_ACTIVE && !reconnect)
+    return; // current connection not affected
+  // Fresh start: no failed networks, no previous attempt to count as failed
+  _wifiFailMask = 0;
+  _wifiIdx = -1;
+  if (_mode == NetMode::WIFI_ACTIVE) {
+    // Connect straight away: left to update(), WiFi.status() can still read
+    // connected for a moment and the old connection would just be kept.
+    Serial.println("[NET] WiFi settings changed - reconnecting");
+    _mode = NetMode::NONE;
+    _wifiConnect();
+  } else {
+    Serial.println("[NET] WiFi settings changed - trying now");
+    _wifiAttempted = false; // update() connects on its next pass (when Ethernet isn't in use)
+  }
+}
+
 const char *NetManager::modeStr() const {
   switch (_mode) {
   case NetMode::ETH_ACTIVE:

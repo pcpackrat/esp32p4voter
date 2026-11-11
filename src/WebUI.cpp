@@ -145,6 +145,15 @@ static void handleRoot() {
           "<tr><td>PPS jitter</td><td id=\"jit\">-</td></tr>"
           "<tr><td>Location</td><td id=\"loc\">-</td></tr>"
           "</table></div>";
+  // Shown only while GPS diagnostics are on (GPS page)
+  html += "<div class=\"card\" id=\"gdcard\" style=\"display:none\"><h2>GPS Diagnostics</h2><table>"
+          "<tr><td>Fix</td><td id=\"gdfix\">-</td></tr>"
+          "<tr><td>Time to first fix</td><td id=\"gdttff\">-</td></tr>"
+          "<tr><td>Satellites</td><td id=\"gdsat\">-</td></tr>"
+          "<tr><td>Signal (dBHz)</td><td id=\"gdsv\">-</td></tr>"
+          "<tr><td>Antenna</td><td id=\"gdant\">-</td></tr>"
+          "<tr><td>Noise / AGC</td><td id=\"gdhw\">-</td></tr>"
+          "</table></div>";
   html += "<div class=\"card\"><h2>Network</h2><table>"
           "<tr><td>Interface</td><td id=\"iface\">-</td></tr>"
           "<tr><td>IP</td><td id=\"ip\">-</td></tr>"
@@ -174,6 +183,20 @@ static void handleRoot() {
           "st('jb',s.jb+' bytes'+(s.jbbuf?' (buffering)':''));st('txpk',db(s.txpk)+' FS');st('wrerr',s.wrerr);"
           "st('gps',s.gps,s.gps=='LOCKED');st('sats',s.sats);st('utc',s.utc);st('jit',s.jit+' us');"
           "st('loc',s.lat+', '+s.lon+' (elev '+s.elev+' m)');"
+          "var g=s.gdiag,gc=document.getElementById('gdcard');"
+          "if(!g){gc.style.display='none';}else{gc.style.display='';"
+          "st('gdfix',g.fresh?g.fix:'no data',g.fresh&&g.fix!='no fix');"
+          "st('gdttff',g.ttff,g.ttff.indexOf('waiting')<0);"
+          "st('gdsat',g.svage<0?'no data':g.trk+' with signal, '+g.lck+' locked, '+g.used+' used, best '+g.best+' dBHz',g.used>=4);"
+          "var h='';g.sv.sort(function(a,b){return b[1]-a[1];}).forEach(function(v){"
+          "h+='<div style=\"display:flex;align-items:center;gap:6px;font-size:12px\">"
+          "<span style=\"width:2.2em;text-align:right\">'+v[0]+'</span>"
+          "<span style=\"display:inline-block;height:9px;width:'+(v[1]*2)+'px;background:'"
+          "+(v[2]==2?'#2e7d32':(v[2]==1?'#f9a825':'#9e9e9e'))+'\"></span>'"
+          "+v[1]+(v[2]==2?' used':(v[2]==1?' locked':''))+'</div>';});"
+          "document.getElementById('gdsv').innerHTML=h||'none';"
+          "st('gdant',g.ant,g.ant=='OK');"
+          "st('gdhw',g.hwage<0?'no data':'noise '+g.noise+', AGC '+g.agc+' ('+Math.round(g.agc/81.91)+'%)');}"
           "st('nmea',s.nmage<0?'nothing received':s.nmea+' chars, '+s.nmok+' good / '+s.nmbad+' bad, last '+(s.nmage/1000).toFixed(1)+' s ago',"
           "s.nmage>=0&&s.nmage<2000&&s.nmok>0);st('ppsok',s.ppsok?'OK (1 Hz)':'none',s.ppsok);st('tmode',s.tmode);"
           "st('iface',s.iface,s.iface=='ETH'||s.iface=='WIFI');st('ip',s.ip);st('link',s.link);"
@@ -215,7 +238,7 @@ static void handleApiStatus() {
   if (net.mode() == NetMode::ETH_ACTIVE) {
     link = String(ETH.linkSpeed()) + " Mbps " + (ETH.fullDuplex() ? "full" : "half");
   } else if (net.mode() == NetMode::WIFI_ACTIVE) {
-    link = String(WiFi.RSSI()) + " dBm";
+    link = "\"" + WiFi.SSID() + "\" (network " + String(net.wifiNetIndex() + 1) + "), " + String(WiFi.RSSI()) + " dBm";
   } else if (net.mode() == NetMode::AP_SETUP) {
     link = "Setup hotspot \"" AP_SSID "\", " + String(net.apSecondsLeft()) + " s left";
   }
@@ -224,7 +247,10 @@ static void handleApiStatus() {
                                                : voter.getHostIP().toString();
   host += ":" + String(cfg.data.hostPort);
 
-  char buf[1792];
+  char gdiag[512];
+  gps.diagJson(gdiag, sizeof(gdiag));
+
+  char buf[2304];
   snprintf(buf, sizeof(buf),
            "{\"voter\":\"%s\",\"host\":\"%s\",\"sent\":%lu,\"rpt\":\"%s\",\"wg\":\"%s\","
            "\"cos\":%s,\"rssi\":%u,\"hwrssi\":%s,\"rheld\":%u,\"rssiraw\":%u,\"noise\":%u,\"adcpk\":%.1f,\"encpk\":%.1f,"
@@ -233,7 +259,7 @@ static void handleApiStatus() {
            "\"gps\":\"%s\",\"sats\":%lu,\"utc\":\"%s\",\"jit\":%lu,"
            "\"nmea\":%lu,\"nmok\":%lu,\"nmbad\":%lu,\"nmage\":%ld,\"ppsok\":%s,\"tmode\":\"%s\","
            "\"lat\":\"%s\",\"lon\":\"%s\",\"elev\":\"%s\","
-           "\"iface\":\"%s\",\"ip\":\"%s\",\"link\":\"%s\",\"up\":%lu,\"heap\":%lu}",
+           "\"iface\":\"%s\",\"ip\":\"%s\",\"link\":\"%s\",\"up\":%lu,\"heap\":%lu,\"gdiag\":%s}",
            jsonEscape(voterState).c_str(), jsonEscape(host.c_str()).c_str(),
            (unsigned long)voter.getAudioFramesSent(), jsonEscape(rptState).c_str(),
            jsonEscape(wgState).c_str(), g_status.cos ? "true" : "false",
@@ -256,7 +282,7 @@ static void handleApiStatus() {
            lat, lon,
            jsonEscape(elev).c_str(), net.modeStr(), net.localIP().toString().c_str(),
            jsonEscape(link.c_str()).c_str(),
-           (unsigned long)(millis() / 1000), (unsigned long)ESP.getFreeHeap());
+           (unsigned long)(millis() / 1000), (unsigned long)ESP.getFreeHeap(), gdiag);
   webServer.send(200, "application/json", buf);
 }
 
@@ -524,7 +550,7 @@ static void handleWiFi() {
   if (net.mode() == NetMode::AP_SETUP) {
     html += "<div class=\"card\"><h2><span class=\"status warn\">Setup Hotspot Active</span></h2>";
     html += "<p>No Ethernet or working WiFi was found, so this device is broadcasting its own \"" AP_SSID "\" network. "
-            "Enter your network below and Save - the device will reboot and try to connect.</p>";
+            "Enter your network below and Save - it connects right away and the hotspot closes once connected.</p>";
     html += "<p>Gives up in " + String(net.apSecondsLeft()) + "s if nothing is saved.</p></div>";
   }
   html += "<div class=\"card\"><h2>WiFi</h2>";
@@ -538,39 +564,78 @@ static void handleWiFi() {
     html += "<p><span class=\"status ok\">Connected</span> \"" + htmlEscape(WiFi.SSID().c_str()) + "\" (network " +
             String(net.wifiNetIndex() + 1) + "), " + String(WiFi.RSSI()) + " dBm</p>";
   }
-  html += "<form method=\"POST\" action=\"/wifi\">";
+  html += "</div>";
+
+  // Saved networks: one row per slot, each with its own Clear button
+  html += "<div class=\"card\"><h2>Saved Networks</h2><table>"
+          "<tr><th>Network</th><th>SSID</th><th>Password</th><th></th></tr>";
+  int firstEmpty = -1;
+  for (int i = 0; i < WIFI_MAX_NETS; i++) {
+    bool saved = cfg.wifiSsid(i)[0] != '\0';
+    if (!saved && firstEmpty < 0)
+      firstEmpty = i;
+    bool inUse = net.mode() == NetMode::WIFI_ACTIVE && net.wifiNetIndex() == i;
+    html += "<tr><td>" + String(i + 1) + "</td><td>";
+    html += saved ? htmlEscape(cfg.wifiSsid(i)) + (inUse ? " <span class=\"status ok\">in use</span>" : "")
+                  : String("<i>empty</i>");
+    html += "</td><td>" + String(saved ? (cfg.wifiPass(i)[0] ? "saved" : "none (open)") : "") + "</td><td>";
+    if (saved) {
+      html += "<form method=\"POST\" action=\"/wifi/clear\" style=\"margin:0\" onsubmit=\"return confirm('Clear network " +
+              String(i + 1) + "?')\"><input type=\"hidden\" name=\"slot\" value=\"" + String(i) +
+              "\"><input type=\"submit\" value=\"Clear\" class=\"btn\"></form>";
+    }
+    html += "</td></tr>";
+  }
+  html += "</table>";
+  html += "<form method=\"POST\" action=\"/wifi/pin\">";
   html += "<label>Connect to:</label><select name=\"pin\">";
   html += String("<option value=\"auto\"") + (cfg.wifiNets.pinned >= WIFI_MAX_NETS ? " selected" : "") +
           ">Auto - strongest saved network in range</option>";
   for (int i = 0; i < WIFI_MAX_NETS; i++) {
+    if (!cfg.wifiSsid(i)[0] && cfg.wifiNets.pinned != i)
+      continue;
     html += "<option value=\"" + String(i) + "\"" + (cfg.wifiNets.pinned == i ? " selected" : "") + ">Network " +
-            String(i + 1) + " only" + (cfg.wifiSsid(i)[0] ? String(" (") + htmlEscape(cfg.wifiSsid(i)) + ")" : String("")) +
-            "</option>";
+            String(i + 1) + " only (" + htmlEscape(cfg.wifiSsid(i)) + ")</option>";
+  }
+  html += "</select><button type=\"submit\" name=\"action\" value=\"save\" class=\"btn\">Save</button> "
+          "<button type=\"submit\" name=\"action\" value=\"reboot\" class=\"btn\">Save &amp; Reboot</button></form></div>";
+
+  // Add or replace one network
+  if (firstEmpty < 0)
+    firstEmpty = 0;
+  html += "<div class=\"card\"><h2>Add / Change Network</h2><form method=\"POST\" action=\"/wifi\">";
+  html += "<label>Network:</label><select name=\"slot\">";
+  for (int i = 0; i < WIFI_MAX_NETS; i++) {
+    html += "<option value=\"" + String(i) + "\"" + (i == firstEmpty ? " selected" : "") + ">Network " + String(i + 1) +
+            " - " + (cfg.wifiSsid(i)[0] ? htmlEscape(cfg.wifiSsid(i)) + " (replace)" : String("empty")) + "</option>";
   }
   html += "</select>";
+  html += "<label>SSID:</label><input type=\"text\" id=\"ssid\" name=\"ssid\" maxlength=\"32\" required>";
   html += "<button type=\"button\" class=\"btn\" onclick=\"scanWifi()\">Scan for Networks</button>";
-  html += "<div id=\"scanStatus\"></div><datalist id=\"scanList\"></datalist>";
-  for (int i = 0; i < WIFI_MAX_NETS; i++) {
-    bool saved = cfg.wifiSsid(i)[0] != '\0';
-    html += "<h3>Network " + String(i + 1) + "</h3>";
-    html += "<label>SSID:</label><input type=\"text\" name=\"ssid" + String(i) +
-            "\" list=\"scanList\" maxlength=\"32\" value=\"" + htmlEscape(cfg.wifiSsid(i)) + "\">";
-    html += "<label>Password:</label><input type=\"password\" class=\"wpass\" name=\"pass" + String(i) +
-            "\" maxlength=\"64\"" +
-            (saved && cfg.wifiPass(i)[0] ? " placeholder=\"saved - leave blank to keep\"" : "") + ">";
-  }
-  html += "<label><input type=\"checkbox\" onclick=\"var t=this.checked?'text':'password';"
-          "document.querySelectorAll('.wpass').forEach(function(e){e.type=t;})\"> Show passwords</label>";
-  html += "<p>Clear an SSID to delete that network. Passwords are never shown once saved.</p>";
-  html += "<input type=\"submit\" value=\"Save &amp; Reboot\" class=\"btn\"></form></div>";
+  html += "<div id=\"scanStatus\"></div><div id=\"scanList\"></div>";
+  html += "<label>Password:</label><input type=\"password\" id=\"wpass\" name=\"pass\" maxlength=\"64\" "
+          "placeholder=\"blank = open network, or keep the saved one if the SSID is unchanged\">";
+  html += "<label><input type=\"checkbox\" onclick=\"document.getElementById('wpass').type=this.checked?'text':'password'\">"
+          " Show password</label>";
+  html += "<p>Passwords are never shown once saved. Save applies right away: it reconnects only if this "
+          "changes the network in use (or WiFi isn't connected).</p>";
+  html += "<button type=\"submit\" name=\"action\" value=\"save\" class=\"btn\">Save</button> "
+          "<button type=\"submit\" name=\"action\" value=\"reboot\" class=\"btn\">Save &amp; Reboot</button></form></div>";
+
   html += "<script>";
-  html += "function scanWifi(){document.getElementById('scanStatus').innerText='Scanning...';fetch('/wifi/scan',{method:'POST'}).then(pollScan);}";
+  html += "function scanWifi(){document.getElementById('scanStatus').innerText='Scanning...';"
+          "document.getElementById('scanList').innerHTML='';fetch('/wifi/scan',{method:'POST'}).then(pollScan);}";
+  // Results: one network per line, "ssid<TAB>rssi<TAB>secure", strongest first
   html += "function pollScan(){fetch('/wifi/scan_results').then(function(r){return r.text();}).then(function(text){"
           "if(text==='running'){setTimeout(pollScan,1000);return;}"
-          "var networks=text.split('\\n').filter(function(s){return s.length>0;});"
-          "var dl=document.getElementById('scanList');dl.innerHTML='';"
-          "networks.forEach(function(ssid){var opt=document.createElement('option');opt.value=ssid;dl.appendChild(opt);});"
-          "document.getElementById('scanStatus').innerText=networks.length?('Found: '+networks.join(', ')+' - pick one in an SSID box'):'No networks found';"
+          "var nets=text.split('\\n').filter(function(s){return s.length>0;}).map(function(l){return l.split('\\t');});"
+          "var box=document.getElementById('scanList');box.innerHTML='';"
+          "nets.forEach(function(n){var b=document.createElement('button');b.type='button';b.className='btn';"
+          "b.style.display='block';b.style.margin='4px 0';"
+          "b.textContent=n[0]+'  ('+n[1]+' dBm'+(n[2]=='1'?', secured':', open')+')';"
+          "b.onclick=function(){document.getElementById('ssid').value=n[0];document.getElementById('wpass').focus();};"
+          "box.appendChild(b);});"
+          "document.getElementById('scanStatus').innerText=nets.length?'Pick a network:':'No networks found';"
           "});}";
   html += "</script>";
   html += htmlFooter();
@@ -596,12 +661,27 @@ static void handleWifiScanResults() {
     webServer.send(200, "text/plain", "running");
     return;
   }
+  // One line per SSID (strongest access point only), strongest first:
+  // ssid<TAB>rssi<TAB>secure(0/1)
   String out;
-  for (int i = 0; i < n; i++) {
-    String ssid = WiFi.SSID(i);
-    if (ssid.length() == 0)
-      continue;
-    out += ssid + "\n";
+  bool done[64] = {false};
+  int count = n < 64 ? n : 64;
+  for (;;) {
+    int best = -1;
+    for (int i = 0; i < count; i++) {
+      if (!done[i] && WiFi.SSID(i).length() && (best < 0 || WiFi.RSSI(i) > WiFi.RSSI(best)))
+        best = i;
+    }
+    if (best < 0)
+      break;
+    String ssid = WiFi.SSID(best);
+    for (int i = 0; i < count; i++) {
+      if (WiFi.SSID(i) == ssid)
+        done[i] = true; // same network from other access points
+    }
+    ssid.replace("\t", " ");
+    ssid.replace("\n", " ");
+    out += ssid + "\t" + String(WiFi.RSSI(best)) + "\t" + (WiFi.encryptionType(best) == WIFI_AUTH_OPEN ? "0" : "1") + "\n";
   }
   WiFi.scanDelete();
   // Put WiFi back as it was (don't stop a connect that is in progress)
@@ -611,22 +691,80 @@ static void handleWifiScanResults() {
   webServer.send(200, "text/plain", out);
 }
 
-static void handleWiFiPost() {
-  for (int i = 0; i < WIFI_MAX_NETS; i++) {
-    String ssid = webServer.arg("ssid" + String(i));
-    String pass = webServer.arg("pass" + String(i));
-    // Blank password on an unchanged SSID keeps the saved one
-    if (ssid.length() && pass.length() == 0 && ssid == cfg.wifiSsid(i))
-      pass = cfg.wifiPass(i);
-    cfg.setWifi(i, ssid.length() ? ssid.c_str() : "", ssid.length() ? pass.c_str() : "");
+// Slot number from the form, -1 if missing or out of range
+static int wifiSlotArg() {
+  if (!webServer.hasArg("slot"))
+    return -1;
+  int i = webServer.arg("slot").toInt();
+  return (i >= 0 && i < WIFI_MAX_NETS) ? i : -1;
+}
+
+static void redirectToWifi() {
+  webServer.sendHeader("Location", "/wifi", true);
+  webServer.send(303, "text/plain", "");
+}
+
+// After a WiFi change: reboot if asked, otherwise apply now and back to the page
+static void wifiFinish(bool reconnect) {
+  if (webServer.arg("action") == "reboot") {
+    scheduleReboot();
+    sendRedirectToRebooting();
+    return;
   }
+  net.wifiApply(reconnect);
+  redirectToWifi();
+}
+
+static bool wifiSlotInUse(int i) { return net.mode() == NetMode::WIFI_ACTIVE && net.wifiNetIndex() == i; }
+
+// Add or replace the network in one slot
+static void handleWiFiPost() {
+  int i = wifiSlotArg();
+  String ssid = webServer.arg("ssid");
+  String pass = webServer.arg("pass");
+  ssid.trim();
+  if (i < 0 || ssid.length() == 0) {
+    redirectToWifi();
+    return;
+  }
+  // Blank password on an unchanged SSID keeps the saved one
+  if (pass.length() == 0 && ssid == cfg.wifiSsid(i))
+    pass = cfg.wifiPass(i);
+  bool changed = ssid != cfg.wifiSsid(i) || pass != cfg.wifiPass(i);
+  cfg.setWifi(i, ssid.c_str(), pass.c_str());
+  cfg.save(); // slot 1 lives in the main config
+  cfg.saveWifiNets();
+  // Reconnect only if the network in use changed, or it is now pinned elsewhere
+  uint8_t pin = cfg.wifiNets.pinned;
+  wifiFinish((changed && wifiSlotInUse(i)) || (pin == i && !wifiSlotInUse(i)));
+}
+
+// Clear one slot. Reconnects only if it is the network in use.
+static void handleWiFiClearPost() {
+  int i = wifiSlotArg();
+  if (i < 0) {
+    redirectToWifi();
+    return;
+  }
+  bool inUse = wifiSlotInUse(i);
+  cfg.setWifi(i, "", "");
+  if (cfg.wifiNets.pinned == i)
+    cfg.wifiNets.pinned = WIFI_PIN_AUTO;
+  cfg.save();
+  cfg.saveWifiNets();
+  if (inUse)
+    net.wifiApply(true);
+  redirectToWifi();
+}
+
+static void handleWiFiPinPost() {
   String pin = webServer.arg("pin");
   int p = pin == "auto" ? -1 : pin.toInt();
   cfg.wifiNets.pinned = (p >= 0 && p < WIFI_MAX_NETS && cfg.wifiSsid(p)[0]) ? (uint8_t)p : WIFI_PIN_AUTO;
-  cfg.save();
   cfg.saveWifiNets();
-  scheduleReboot();
-  sendRedirectToRebooting();
+  // Pinned to a slot other than the one in use -> move to it. Auto: stay put.
+  uint8_t pinned = cfg.wifiNets.pinned;
+  wifiFinish(pinned < WIFI_MAX_NETS && !wifiSlotInUse(pinned));
 }
 
 // ---------------------------------------------------------------------------
@@ -1090,6 +1228,13 @@ static void handleGps() {
   html += "<form method=\"POST\" action=\"/gps/cold\" onsubmit=\"return confirm('Cold start the GPS? It erases its almanac, "
           "ephemeris, position and time. GPS lock is lost until it gets a new fix.')\">"
           "<input type=\"submit\" value=\"Cold start GPS\" class=\"btn\"></form></div>";
+
+  html += "<div class=\"card\"><h2>GPS Diagnostics</h2><form method=\"POST\" action=\"/gps/diag\">";
+  html += "<p>Logs the GPS module's version and settings (at boot and after a cold start), its text "
+          "messages, rejected commands, and satellites / signal levels every 30 s while there is no fix. "
+          "Also shows a GPS Diagnostics card on the Status page.</p>";
+  html += checkbox("diag", cfg.gpsAid.diag, "Enable GPS diagnostic logging");
+  html += "<input type=\"submit\" value=\"Save\" class=\"btn\"></form></div>";
   html += htmlFooter();
   webServer.send(200, "text/html", html);
 }
@@ -1131,6 +1276,14 @@ static void handleGpsAidPost() {
 
 static void handleGpsColdPost() {
   gps.coldStart();
+  webServer.sendHeader("Location", "/gps", true);
+  webServer.send(303, "text/plain", "");
+}
+
+static void handleGpsDiagPost() {
+  cfg.gpsAid.diag = webServer.hasArg("diag");
+  cfg.saveGpsAid();
+  gps.diagChanged(); // applies now, no reboot
   webServer.sendHeader("Location", "/gps", true);
   webServer.send(303, "text/plain", "");
 }
@@ -1307,6 +1460,8 @@ void webBegin() {
   webServer.on("/network", HTTP_POST, handleNetworkPost);
   webServer.on("/wifi", HTTP_GET, handleWiFi);
   webServer.on("/wifi", HTTP_POST, handleWiFiPost);
+  webServer.on("/wifi/clear", HTTP_POST, handleWiFiClearPost);
+  webServer.on("/wifi/pin", HTTP_POST, handleWiFiPinPost);
   webServer.on("/wifi/scan", HTTP_POST, handleWifiScanStart);
   webServer.on("/wifi/scan_results", HTTP_GET, handleWifiScanResults);
   webServer.on("/rebooting", HTTP_GET, handleRebootingPage);
@@ -1323,6 +1478,7 @@ void webBegin() {
   webServer.on("/gps", HTTP_POST, handleGpsPost);
   webServer.on("/gps/aid", HTTP_POST, handleGpsAidPost);
   webServer.on("/gps/cold", HTTP_POST, handleGpsColdPost);
+  webServer.on("/gps/diag", HTTP_POST, handleGpsDiagPost);
   webServer.on("/backup", HTTP_GET, handleBackup);
   webServer.on("/backup/export", HTTP_GET, handleBackupExport);
   webServer.on("/backup/import", HTTP_POST, handleBackupImport, handleBackupUpload);

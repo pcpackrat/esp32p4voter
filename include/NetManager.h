@@ -23,6 +23,9 @@ public:
   IPAddress apIP() const { return _apIP; }
   uint32_t apSecondsLeft() const;
   int wifiNetIndex() const { return _wifiIdx; } // saved network in use / being tried, -1 = none
+  // Saved WiFi networks changed (WiFi page). Not connected: try now. On WiFi:
+  // reconnect only when reconnect = true. On Ethernet: nothing.
+  void wifiApply(bool reconnect);
 
   // Auto mode: switch to WiFi after this long with no cable / no address
   static const uint32_t ETH_LINK_DOWN_FAILOVER_MS = 1000;

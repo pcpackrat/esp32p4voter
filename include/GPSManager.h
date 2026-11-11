@@ -73,6 +73,8 @@ public:
   // boot, and a GPS cold start if no satellites are used for a long time.
   void requestAid(); // send the aiding again (e.g. after the position changed)
   void coldStart();  // from the GPS web page
+  void diagChanged(); // diagnostic logging switched on/off on the GPS web page
+  void diagJson(char *buf, size_t len); // status page: JSON object, or null when diagnostics are off
   void aidSummary(char *buf, size_t len);
 
   static const char *statusStr(GPSLockStatus s);
@@ -80,6 +82,7 @@ public:
 private:
   HardwareSerial *_gpsSerial;
   TinyGPSPlus _gpsParser;
+  TinyGPSCustom _gpsTxt; // $GPTXT text field: boot banner, antenna status
 
   // PPS state (written by ISR)
   volatile int64_t _lastPpsUs;
@@ -104,7 +107,7 @@ private:
   uint8_t _ubxClass, _ubxId;
   uint16_t _ubxLen, _ubxPos;
   uint8_t _ubxCkA, _ubxCkB;
-  uint8_t _ubxBuf[72]; // largest message used: AID-HUI
+  uint8_t _ubxBuf[208]; // largest message used: NAV-SVINFO (8 + 12 per channel, 16 channels)
 
   TimingStatus _tm;
   bool _canSend;
@@ -124,11 +127,34 @@ private:
   uint32_t _aidSentMs;    // 0 = not sent this boot
   uint32_t _aidFlags;     // what the last AID-INI carried
   uint32_t _huiSentMs;    // last AID-HUI (leap seconds), 0 = not sent this boot
+  bool _huiWritePending;  // AID-HUI poll sent; the readback gets the leap seconds and is written back
   uint32_t _noSatSinceMs; // start of the current no-satellite period
   uint32_t _coldWaitMs;   // no-satellite time before the next cold start
   uint8_t _coldStarts;
+  uint32_t _reinitAtMs;   // after a hardware reset: re-send message config at this millis(), 0 = none
+
+  // Diagnostics (GPS page checkbox): polled every 5 s, shown on the status page
+  struct SvInfo {
+    uint8_t svid, cno, state; // state: 0 signal only, 1 code locked, 2 used in fix
+  };
+  uint32_t _diagPollMs;   // last NAV-SVINFO / MON-HW poll
+  uint32_t _svLogMs;      // last satellite report in the event log
+  bool _svLogNext;        // log the next satellite report (first fix)
+  SvInfo _sv[16];
+  uint8_t _svCount, _svLocked, _svUsed, _svBest;
+  uint32_t _svMs;         // last NAV-SVINFO, 0 = none
+  uint16_t _hwNoise, _hwAgc;
+  uint8_t _hwAStatus;     // 0 init, 1 don't know, 2 OK, 3 short, 4 open
+  uint32_t _hwMs;         // last MON-HW, 0 = none
+  char _antText[16];      // last $GPTXT ANTSTATUS= value
+  uint32_t _fixStartMs;   // boot (0) or last cold start
+  uint32_t _ttffMs;       // time to first fix from _fixStartMs, 0 = no fix yet
+  bool _fixStartCold;     // _fixStartMs is a cold start, not boot
+  bool _haveFix() const { return _tm.gpsFixOk && _navStatusMs != 0 && millis() - _navStatusMs < 3000; }
 
   void _ubxByte(uint8_t c);
+  void _sendMsgConfig();
+  void _pollSettings(); // diagnostic: version + receiver settings to the event log
   bool _sendAidIni();
   void _sendAidHui();
   void _coldStart(const char *why);

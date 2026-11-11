@@ -116,6 +116,7 @@ struct GpsAidConfig {
   bool set;
   int32_t latE7, lonE7; // degrees * 1e7
   int32_t altCm;
+  bool diag; // GPS diagnostic logging (settings, $GPTXT, NAK, satellites) to the event log
 };
 
 // Offline repeater (failover when the voter host is not connected).

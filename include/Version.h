@@ -2,7 +2,7 @@
 #define VERSION_H
 
 #define FIRMWARE_NAME "ESP32-P4 Voter"
-#define FIRMWARE_VERSION "0.1.0"
+#define FIRMWARE_VERSION "0.9.0"
 // Device type in exported settings files; import refuses a different type
 #define DEVICE_TYPE "p4"
 

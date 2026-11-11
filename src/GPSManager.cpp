@@ -22,6 +22,7 @@ static portMUX_TYPE s_gpsMux = portMUX_INITIALIZER_UNLOCKED;
 #define UBX_CLS_AID 0x0B
 #define UBX_NAV_STATUS 0x03
 #define UBX_NAV_TIMEUTC 0x21
+#define UBX_NAV_SVINFO 0x30
 #define UBX_CFG_MSG 0x01
 #define UBX_CFG_RST 0x04
 #define UBX_CFG_CFG 0x09
@@ -29,6 +30,16 @@ static portMUX_TYPE s_gpsMux = portMUX_INITIALIZER_UNLOCKED;
 #define UBX_TIM_SVIN 0x04
 #define UBX_AID_INI 0x01
 #define UBX_AID_HUI 0x02
+#define UBX_CLS_ACK 0x05
+#define UBX_ACK_NAK 0x00
+#define UBX_CLS_MON 0x0A
+#define UBX_MON_VER 0x04
+#define UBX_MON_HW 0x09
+#define UBX_CFG_RXM 0x11
+#define UBX_CFG_ANT 0x13
+#define UBX_CFG_SBAS 0x16
+#define UBX_CFG_NAVX5 0x23
+#define UBX_CFG_NAV5 0x24
 
 static const uint32_t TMODE_POLL_MS = 5000;
 static const uint8_t TMODE_MAX_SETS = 3; // per boot - each one writes GPS flash
@@ -73,7 +84,7 @@ static uint32_t accToVar(uint32_t accMm) {
   return accMm * accMm;
 }
 
-GPSManager::GPSManager() {
+GPSManager::GPSManager() : _gpsTxt(_gpsParser, "GPTXT", 4) {
   _gpsSerial = nullptr;
   _lastPpsUs = 0;
   _ppsTriggered = false;
@@ -107,9 +118,23 @@ GPSManager::GPSManager() {
   _aidSentMs = 0;
   _aidFlags = 0;
   _huiSentMs = 0;
+  _huiWritePending = false;
   _noSatSinceMs = 0;
   _coldWaitMs = COLD_FIRST_MS;
   _coldStarts = 0;
+  _reinitAtMs = 0;
+  _diagPollMs = 0;
+  _svLogMs = 0;
+  _svLogNext = false;
+  _svCount = _svLocked = _svUsed = _svBest = 0;
+  _svMs = 0;
+  _hwNoise = _hwAgc = 0;
+  _hwAStatus = 1;
+  _hwMs = 0;
+  _antText[0] = '\0';
+  _fixStartMs = 0;
+  _ttffMs = 0;
+  _fixStartCold = false;
   _instance = this;
 }
 
@@ -157,17 +182,50 @@ void GPSManager::begin(HardwareSerial *port, int rxPin, int txPin, int ppsPin) {
   attachInterrupt(digitalPinToInterrupt(ppsPin), _ppsISR, RISING);
 
   if (_canSend) {
-    // UBX outputs at 1 per navigation solution: fix type, UTC time, survey
-    // progress. Sent each boot (not saved) so a GPS power cycle on its own
-    // just falls back to NMEA.
-    const uint8_t msgs[][2] = {{UBX_CLS_NAV, UBX_NAV_STATUS},
-                               {UBX_CLS_NAV, UBX_NAV_TIMEUTC},
-                               {UBX_CLS_TIM, UBX_TIM_SVIN}};
-    for (auto &m : msgs) {
-      uint8_t p[3] = {m[0], m[1], 1};
-      _ubxSend(UBX_CLS_CFG, UBX_CFG_MSG, p, sizeof(p));
-    }
+    _sendMsgConfig();
     _pollTimeMode();
+    if (cfg.gpsAid.diag)
+      _pollSettings();
+  }
+}
+
+void GPSManager::diagChanged() {
+  if (cfg.gpsAid.diag) {
+    logger.info("GPS", "Diagnostic logging on");
+    _pollSettings();
+    _diagPollMs = 0; // poll on the next update
+    _svLogMs = 0;    // and log the satellites if there is no fix
+  } else {
+    logger.info("GPS", "Diagnostic logging off");
+  }
+}
+
+void GPSManager::_pollSettings() {
+  const uint8_t polls[][2] = {{UBX_CLS_MON, UBX_MON_VER}, {UBX_CLS_CFG, UBX_CFG_RXM},
+                              {UBX_CLS_CFG, UBX_CFG_NAV5}, {UBX_CLS_CFG, UBX_CFG_NAVX5},
+                              {UBX_CLS_CFG, UBX_CFG_ANT},  {UBX_CLS_CFG, UBX_CFG_SBAS}};
+  for (auto &m : polls)
+    _ubxSend(m[0], m[1], nullptr, 0);
+}
+
+// Payload as hex, no spaces, so a whole CFG message fits one log line
+static void toHex(const uint8_t *p, uint16_t len, char *out, size_t outLen) {
+  size_t o = 0;
+  for (uint16_t i = 0; i < len && o + 3 <= outLen; i++)
+    o += snprintf(out + o, outLen - o, "%02X", p[i]);
+  out[o] = '\0';
+}
+
+// UBX outputs at 1 per navigation solution: fix type, UTC time, survey
+// progress. Sent each boot and after a GPS hardware reset (not saved), so a
+// GPS power cycle on its own just falls back to NMEA.
+void GPSManager::_sendMsgConfig() {
+  const uint8_t msgs[][2] = {{UBX_CLS_NAV, UBX_NAV_STATUS},
+                             {UBX_CLS_NAV, UBX_NAV_TIMEUTC},
+                             {UBX_CLS_TIM, UBX_TIM_SVIN}};
+  for (auto &m : msgs) {
+    uint8_t p[3] = {m[0], m[1], 1};
+    _ubxSend(UBX_CLS_CFG, UBX_CFG_MSG, p, sizeof(p));
   }
 }
 
@@ -204,6 +262,27 @@ void GPSManager::update() {
     }
   }
 
+  // After a GPS hardware reset: message outputs are back to defaults
+  if (_canSend && _reinitAtMs != 0 && (int32_t)(millis() - _reinitAtMs) >= 0) {
+    _reinitAtMs = 0;
+    _sendMsgConfig();
+    _tm.answered = false;
+    _pollTimeMode();
+    if (cfg.gpsAid.diag)
+      _pollSettings();
+    logger.info("GPS", "Message config re-sent after hardware reset");
+  }
+
+  // Module text messages: boot banner (proves a real restart), antenna status.
+  // value() also clears the updated flag, so it is read either way.
+  if (_gpsTxt.isUpdated()) {
+    const char *txt = _gpsTxt.value();
+    if (strncmp(txt, "ANTSTATUS=", 10) == 0)
+      strlcpy(_antText, txt + 10, sizeof(_antText));
+    if (cfg.gpsAid.diag)
+      logger.info("GPS", "TXT: %s", txt);
+  }
+
   // 3. Keep asking for the timing mode until the module answers
   if (_canSend && !_tm.answered && millis() - _lastPollMs > TMODE_POLL_MS) {
     _pollTimeMode();
@@ -228,6 +307,25 @@ void GPSManager::update() {
         _coldStart("No satellites");
       }
     }
+  }
+
+  // Time to first fix, from boot or the last cold start
+  if (_ttffMs == 0 && _haveFix()) {
+    _ttffMs = millis() - _fixStartMs;
+    if (_ttffMs == 0)
+      _ttffMs = 1;
+    if (cfg.gpsAid.diag) {
+      logger.info("GPS", "Fix: type %u, %lu s after %s", (unsigned)_tm.gpsFix, (unsigned long)(_ttffMs / 1000),
+                  _fixStartCold ? "cold start" : "boot");
+      _svLogNext = true; // log the satellites used for it
+    }
+  }
+
+  // Diagnostics: satellites / signal levels and antenna / noise every 5 s
+  if (_canSend && _gotByte && cfg.gpsAid.diag && (_diagPollMs == 0 || millis() - _diagPollMs >= 5000)) {
+    _diagPollMs = millis();
+    _ubxSend(UBX_CLS_NAV, UBX_NAV_SVINFO, nullptr, 0);
+    _ubxSend(UBX_CLS_MON, UBX_MON_HW, nullptr, 0);
   }
 
   // 5. Leap seconds: only while the module says UTC isn't valid, so real
@@ -421,25 +519,29 @@ bool GPSManager::_sendAidIni() {
   return true;
 }
 
-// AID-HUI (72 bytes): only the leap seconds are set. utcLS (byte 26) and utcLSF
-// (byte 32) are both GPS_LEAP_S, the leap event date stays zero (long past).
-// flags (byte 68) 0x02 = UTC fields valid; health and iono are marked not valid.
+// AID-HUI (72 bytes): health U4 (byte 0, bit per SV, set = healthy), UTC
+// fields, utcLS I2 (byte 26), utcWNF I2 (28), utcLSF I2 (32), iono, flags X4
+// (byte 68: 0x01 health valid, 0x02 UTC valid, 0x04 iono valid).
+// Read-modify-write: poll first, then the readback handler sets only the leap
+// seconds and the UTC-valid bit and writes it back. Writing a zeroed message
+// also set the health mask to 0 = every satellite unhealthy, and the module
+// then would not use any satellite until it decoded the almanac health page.
 void GPSManager::_sendAidHui() {
-  uint8_t p[72] = {0};
-  p[26] = (uint8_t)GPS_LEAP_S;
-  p[32] = (uint8_t)GPS_LEAP_S;
-  wrU4(p + 68, 0x02);
-  _ubxSend(UBX_CLS_AID, UBX_AID_HUI, p, sizeof(p));
-  _ubxSend(UBX_CLS_AID, UBX_AID_HUI, nullptr, 0); // poll: read back what the module holds
+  _ubxSend(UBX_CLS_AID, UBX_AID_HUI, nullptr, 0);
+  _huiWritePending = true;
   _huiSentMs = millis();
-  logger.info("GPS", "Leap seconds sent: %d", (int)GPS_LEAP_S);
 }
 
 // CFG-RST: clear all navigation data (almanac, ephemeris, position, time),
-// GPS-only controlled reset - settings and the ESP32 are not touched.
+// hardware (watchdog) reset of the GPS - saved settings and the ESP32 are not
+// touched. Unsaved message outputs are lost, so they are re-sent once it is up.
 void GPSManager::_coldStart(const char *why) {
-  uint8_t p[4] = {0xFF, 0xFF, 0x02, 0x00};
+  uint8_t p[4] = {0xFF, 0xFF, 0x00, 0x00};
   _ubxSend(UBX_CLS_CFG, UBX_CFG_RST, p, sizeof(p));
+  _reinitAtMs = millis() + 2000;
+  _fixStartMs = millis();
+  _fixStartCold = true;
+  _ttffMs = 0;
   _coldStarts++;
   _coldWaitMs = COLD_REPEAT_MS;
   _noSatSinceMs = millis();
@@ -602,9 +704,126 @@ void GPSManager::_ubxHandle() {
 
   } else if (_ubxClass == UBX_CLS_AID && _ubxId == UBX_AID_HUI && _ubxLen == 72) {
     // utcWNF is non-zero when the values came from the satellites, 0 when they are ours
-    logger.info("GPS", "AID-HUI readback: utcLS %d, utcLSF %d, utcWNF %d, flags 0x%02lX",
+    logger.info("GPS", "AID-HUI readback: utcLS %d, utcLSF %d, utcWNF %d, flags 0x%02lX, health 0x%08lX",
                 (int)(int16_t)rdU2(p + 26), (int)(int16_t)rdU2(p + 32), (int)(int16_t)rdU2(p + 28),
-                (unsigned long)rdU4(p + 68));
+                (unsigned long)rdU4(p + 68), (unsigned long)rdU4(p));
+    if (_huiWritePending) {
+      _huiWritePending = false;
+      bool fromSats = rdU2(p + 28) != 0;
+      if (fromSats || (rdU4(p + 68) & 0x02)) {
+        logger.info("GPS", "Leap seconds not sent: module already has UTC data");
+      } else {
+        uint8_t w[72];
+        memcpy(w, p, sizeof(w)); // keep the module's health, iono and flags
+        w[26] = (uint8_t)GPS_LEAP_S;
+        w[27] = 0;
+        w[32] = (uint8_t)GPS_LEAP_S;
+        w[33] = 0;
+        wrU4(w + 68, rdU4(p + 68) | 0x02);
+        _ubxSend(UBX_CLS_AID, UBX_AID_HUI, w, sizeof(w));
+        _ubxSend(UBX_CLS_AID, UBX_AID_HUI, nullptr, 0); // read back what the module holds now
+        logger.info("GPS", "Leap seconds sent: %d", (int)GPS_LEAP_S);
+      }
+    }
+
+  } else if (_ubxClass == UBX_CLS_NAV && _ubxId == UBX_NAV_SVINFO && _ubxLen >= 8) {
+    // iTOW U4, numCh U1, globalFlags X1, reserved U2, then 12 bytes per channel:
+    // chn U1, svid U1, flags X1 (bit0 used in fix), quality X1 (>= 4 code lock), cno U1 (dBHz), elev I1, ...
+    uint8_t numCh = p[4];
+    if (_ubxLen < 8 + 12 * numCh)
+      numCh = (_ubxLen - 8) / 12;
+    unsigned tracked = 0, used = 0, locked = 0, best = 0;
+    char list[100];
+    size_t o = 0;
+    list[0] = '\0';
+    for (uint8_t i = 0; i < numCh; i++) {
+      const uint8_t *c = p + 8 + 12 * i;
+      uint8_t svid = c[1], flags = c[2], quality = c[3], cno = c[4];
+      if (cno == 0)
+        continue;
+      bool isUsed = flags & 0x01, isLocked = (quality & 0x07) >= 4;
+      if (tracked < sizeof(_sv) / sizeof(_sv[0]))
+        _sv[tracked] = {svid, cno, (uint8_t)(isUsed ? 2 : (isLocked ? 1 : 0))};
+      tracked++;
+      if (isUsed)
+        used++;
+      if (isLocked)
+        locked++;
+      if (cno > best)
+        best = cno;
+      // svid:cno, u = used in fix, * = code locked but not used
+      if (o + 9 < sizeof(list))
+        o += snprintf(list + o, sizeof(list) - o, " %u:%u%s", svid, cno, isUsed ? "u" : (isLocked ? "*" : ""));
+    }
+    _svCount = tracked < 16 ? tracked : 16;
+    _svLocked = locked;
+    _svUsed = used;
+    _svBest = best;
+    _svMs = millis();
+
+    // Event log: every 30 s while there is no fix, and once at the first fix
+    if (cfg.gpsAid.diag && (_svLogNext || (!_haveFix() && (_svLogMs == 0 || millis() - _svLogMs >= 30000)))) {
+      _svLogNext = false;
+      _svLogMs = millis();
+      logger.info("GPS", "SV: fix %u, ch %u, signal %u, locked %u, used %u, best %u dBHz", (unsigned)_tm.gpsFix,
+                  (unsigned)numCh, tracked, locked, used, best);
+      if (tracked)
+        logger.info("GPS", "SV list (svid:dBHz):%s", list);
+    }
+
+  } else if (_ubxClass == UBX_CLS_MON && _ubxId == UBX_MON_HW && _ubxLen >= 22) {
+    // pinSel/pinBank/pinDir/pinVal X4, noisePerMS U2 (16), agcCnt U2 (18), aStatus U1 (20), aPower U1
+    _hwNoise = rdU2(p + 16);
+    _hwAgc = rdU2(p + 18);
+    _hwAStatus = p[20];
+    _hwMs = millis();
+
+  } else if (_ubxClass == UBX_CLS_ACK && _ubxId == UBX_ACK_NAK && _ubxLen == 2) {
+    if (cfg.gpsAid.diag)
+      logger.warn("GPS", "NAK for UBX 0x%02X 0x%02X", p[0], p[1]);
+
+  } else if (_ubxClass == UBX_CLS_MON && _ubxId == UBX_MON_VER && _ubxLen >= 40) {
+    char sw[31], hw[11];
+    memcpy(sw, p, 30);
+    sw[30] = '\0';
+    memcpy(hw, p + 30, 10);
+    hw[10] = '\0';
+    logger.info("GPS", "MON-VER: sw %s, hw %s", sw, hw);
+    for (uint16_t o = 40; o + 30 <= _ubxLen; o += 30) {
+      char ext[31];
+      memcpy(ext, p + o, 30);
+      ext[30] = '\0';
+      logger.info("GPS", "MON-VER ext: %s", ext);
+    }
+
+  } else if (_ubxClass == UBX_CLS_CFG &&
+             (_ubxId == UBX_CFG_RXM || _ubxId == UBX_CFG_NAV5 || _ubxId == UBX_CFG_NAVX5 ||
+              _ubxId == UBX_CFG_ANT || _ubxId == UBX_CFG_SBAS)) {
+    const char *name = _ubxId == UBX_CFG_RXM    ? "RXM"
+                       : _ubxId == UBX_CFG_NAV5 ? "NAV5"
+                       : _ubxId == UBX_CFG_NAVX5 ? "NAVX5"
+                       : _ubxId == UBX_CFG_ANT  ? "ANT"
+                                                : "SBAS";
+    char hex[100];
+    toHex(p, _ubxLen, hex, sizeof(hex));
+    logger.info("GPS", "CFG-%s (%u): %s", name, (unsigned)_ubxLen, hex);
+    // Decoded key fields
+    if (_ubxId == UBX_CFG_RXM && _ubxLen >= 2) {
+      logger.info("GPS", "CFG-RXM: gpsMode %u, lpMode %u (0 = continuous, 1 = power save)", p[0], p[1]);
+    } else if (_ubxId == UBX_CFG_NAV5 && _ubxLen >= 36) {
+      logger.info("GPS", "CFG-NAV5: dynModel %u, fixMode %u, minElev %d deg, pDop %.1f, tDop %.1f, pAcc %u m, tAcc %u m",
+                  p[2], p[3], (int)(int8_t)p[12], rdU2(p + 14) / 10.0, rdU2(p + 16) / 10.0,
+                  (unsigned)rdU2(p + 18), (unsigned)rdU2(p + 20));
+    } else if (_ubxId == UBX_CFG_NAVX5 && _ubxLen >= 15) {
+      logger.info("GPS", "CFG-NAVX5: minSVs %u, maxSVs %u, minCNO %u dBHz, iniFix3D %u", p[10], p[11], p[12],
+                  p[14]);
+    } else if (_ubxId == UBX_CFG_ANT && _ubxLen >= 4) {
+      uint16_t f = rdU2(p);
+      logger.info("GPS", "CFG-ANT: supply ctrl %u, short det %u, open det %u, off on short %u, auto recovery %u",
+                  f & 1, (f >> 1) & 1, (f >> 2) & 1, (f >> 3) & 1, (f >> 4) & 1);
+    } else if (_ubxId == UBX_CFG_SBAS && _ubxLen >= 8) {
+      logger.info("GPS", "CFG-SBAS: mode 0x%02X, usage 0x%02X, maxSBAS %u", p[0], p[1], p[2]);
+    }
   }
 }
 
@@ -815,4 +1034,35 @@ void GPSManager::getGPSStrings(char *lat, char *lon, char *elev) {
     // Elevation in meters, %4.1f, 7-byte protocol field
     snprintf(elev, 7, "%4.1f", _gpsParser.altitude.meters());
   }
+}
+
+void GPSManager::diagJson(char *buf, size_t len) {
+  if (!cfg.gpsAid.diag) {
+    snprintf(buf, len, "null");
+    return;
+  }
+  static const char *const antStr[] = {"INIT", "DONT KNOW", "OK", "SHORT", "OPEN"};
+  const char *from = _fixStartCold ? "cold start" : "boot";
+  char ttff[48];
+  if (_ttffMs)
+    snprintf(ttff, sizeof(ttff), "%lu s after %s", (unsigned long)(_ttffMs / 1000), from);
+  else
+    snprintf(ttff, sizeof(ttff), "waiting, %lu s since %s", (unsigned long)((millis() - _fixStartMs) / 1000), from);
+  char ant[40];
+  if (_hwMs)
+    snprintf(ant, sizeof(ant), "%s", _hwAStatus <= 4 ? antStr[_hwAStatus] : "?");
+  else
+    snprintf(ant, sizeof(ant), "%s", _antText[0] ? _antText : "-");
+
+  size_t o = snprintf(buf, len,
+                      "{\"fix\":\"%s\",\"fresh\":%s,\"ttff\":\"%s\",\"trk\":%u,\"lck\":%u,\"used\":%u,\"best\":%u,"
+                      "\"svage\":%ld,\"ant\":\"%s\",\"noise\":%u,\"agc\":%u,\"hwage\":%ld,\"sv\":[",
+                      fixStr(_tm.gpsFix), (_navStatusMs && millis() - _navStatusMs < 3000) ? "true" : "false",
+                      ttff, (unsigned)_svCount, (unsigned)_svLocked, (unsigned)_svUsed, (unsigned)_svBest,
+                      _svMs ? (long)((millis() - _svMs) / 1000) : -1L, ant, (unsigned)_hwNoise, (unsigned)_hwAgc,
+                      _hwMs ? (long)((millis() - _hwMs) / 1000) : -1L);
+  for (uint8_t i = 0; i < _svCount && o + 16 < len; i++)
+    o += snprintf(buf + o, len - o, "%s[%u,%u,%u]", i ? "," : "", _sv[i].svid, _sv[i].cno, _sv[i].state);
+  if (o + 3 < len)
+    snprintf(buf + o, len - o, "]}");
 }

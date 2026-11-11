@@ -61,8 +61,10 @@ void ConfigManager::begin() {
   }
 
   memset(&gpsAid, 0, sizeof(gpsAid));
-  if (prefs.getBytesLength("gpsaid") == sizeof(gpsAid)) {
-    prefs.getBytes("gpsaid", &gpsAid, sizeof(gpsAid));
+  // An older, shorter block leaves the newer fields at 0
+  size_t aidLen = prefs.getBytesLength("gpsaid");
+  if (aidLen > 0 && aidLen <= sizeof(gpsAid)) {
+    prefs.getBytes("gpsaid", &gpsAid, aidLen);
   }
 
   // Defaults first, then whatever was saved on top (an older, shorter block

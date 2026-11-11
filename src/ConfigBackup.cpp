@@ -88,6 +88,7 @@ String configExportJson() {
   a["latE7"] = cfg.gpsAid.latE7;
   a["lonE7"] = cfg.gpsAid.lonE7;
   a["altCm"] = cfg.gpsAid.altCm;
+  a["diag"] = cfg.gpsAid.diag;
 
   const RptConfig &p = cfg.rpt;
   JsonObject rp = doc["repeater"].to<JsonObject>();
@@ -301,6 +302,7 @@ bool configImportJson(const char *json, size_t len, String &err) {
   getI32(ai, "latE7", a.latE7);
   getI32(ai, "lonE7", a.lonE7);
   getI32(ai, "altCm", a.altCm);
+  getBool(ai, "diag", a.diag);
 
   JsonObjectConst rp = doc["repeater"];
   getBool(rp, "enable", p.enable);
