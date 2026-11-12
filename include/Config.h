@@ -110,8 +110,8 @@ struct GpsTimingConfig {
   uint32_t fixedAccMm;            // Fixed position accuracy (1 sigma)
 };
 
-// Position handed to the GPS at boot (UBX AID-INI) together with the network
-// time, so it searches for the right satellites. Own NVS key.
+// GPS settings under their own NVS key. set/latE7/lonE7/altCm are no longer
+// used (position aiding removed) but stay so stored layouts keep loading.
 struct GpsAidConfig {
   bool set;
   int32_t latE7, lonE7; // degrees * 1e7

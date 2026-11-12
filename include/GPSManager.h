@@ -66,13 +66,9 @@ public:
   // WGS84 conversion for showing the fixed position (ECEF in cm)
   static void ecefToLlh(int32_t x, int32_t y, int32_t z, double *latDeg, double *lonDeg, double *hM);
 
-  // Current NMEA position, false if there is no recent fix
-  bool getCurrentPosition(double *latDeg, double *lonDeg, double *altM);
-
-  // Start-up aiding: network time + saved position (UBX AID-INI) once after
-  // boot, and a GPS cold start if no satellites are used for a long time.
-  void requestAid(); // send the aiding again (e.g. after the position changed)
-  void coldStart();  // from the GPS web page
+  // Start-up aiding: network time (UBX AID-INI) once after boot, and a GPS
+  // cold start if no satellites are used for a long time.
+  void coldStart(); // from the GPS web page
   void diagChanged(); // diagnostic logging switched on/off on the GPS web page
   void diagJson(char *buf, size_t len); // status page: JSON object, or null when diagnostics are off
   void aidSummary(char *buf, size_t len);
@@ -145,6 +141,7 @@ private:
   uint32_t _svMs;         // last NAV-SVINFO, 0 = none
   uint16_t _hwNoise, _hwAgc;
   uint8_t _hwAStatus;     // 0 init, 1 don't know, 2 OK, 3 short, 4 open
+  bool _antOcdSent = false; // CFG-ANT open-circuit detection written since the last message config
   uint32_t _hwMs;         // last MON-HW, 0 = none
   char _antText[16];      // last $GPTXT ANTSTATUS= value
   uint32_t _fixStartMs;   // boot (0) or last cold start

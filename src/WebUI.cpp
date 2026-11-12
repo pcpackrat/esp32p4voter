@@ -150,7 +150,7 @@ static void handleRoot() {
           "<tr><td>Fix</td><td id=\"gdfix\">-</td></tr>"
           "<tr><td>Time to first fix</td><td id=\"gdttff\">-</td></tr>"
           "<tr><td>Satellites</td><td id=\"gdsat\">-</td></tr>"
-          "<tr><td>Signal (dBHz)</td><td id=\"gdsv\">-</td></tr>"
+          "<tr><td>Signal per satellite</td><td id=\"gdsv\">-</td></tr>"
           "<tr><td>Antenna</td><td id=\"gdant\">-</td></tr>"
           "<tr><td>Noise / AGC</td><td id=\"gdhw\">-</td></tr>"
           "</table></div>";
@@ -188,12 +188,17 @@ static void handleRoot() {
           "st('gdfix',g.fresh?g.fix:'no data',g.fresh&&g.fix!='no fix');"
           "st('gdttff',g.ttff,g.ttff.indexOf('waiting')<0);"
           "st('gdsat',g.svage<0?'no data':g.trk+' with signal, '+g.lck+' locked, '+g.used+' used, best '+g.best+' dBHz',g.used>=4);"
+          // Columns: satellite number, signal in dBHz (bar + value), status
+          "var C=['#9e9e9e','#f9a825','#2e7d32'],S=['seen','locked, not used','used in fix'];"
+          "function r(a,b,c,d,hd){return '<div style=\"display:flex;align-items:center;gap:6px;font-size:12px'"
+          "+(hd?';color:#95a5a6':'')+'\"><span style=\"width:4.5em;flex:none;white-space:nowrap;text-align:right\">'+a+'</span>"
+          "<span style=\"flex:none;width:110px\">'+b+'</span><span style=\"flex:none;width:3.5em;text-align:right\">'+c+'</span>"
+          "<span>'+d+'</span></div>';}"
           "var h='';g.sv.sort(function(a,b){return b[1]-a[1];}).forEach(function(v){"
-          "h+='<div style=\"display:flex;align-items:center;gap:6px;font-size:12px\">"
-          "<span style=\"width:2.2em;text-align:right\">'+v[0]+'</span>"
-          "<span style=\"display:inline-block;height:9px;width:'+(v[1]*2)+'px;background:'"
-          "+(v[2]==2?'#2e7d32':(v[2]==1?'#f9a825':'#9e9e9e'))+'\"></span>'"
-          "+v[1]+(v[2]==2?' used':(v[2]==1?' locked':''))+'</div>';});"
+          "h+=r('Sat '+v[0],'<span style=\"display:inline-block;height:9px;width:'+Math.min(v[1]*2,110)+'px;background:'"
+          "+C[v[2]]+'\"></span>',v[1],S[v[2]]);});"
+          "if(h)h=r('Sat','<span style=\"display:inline-block;width:110px\">Signal</span>','dBHz','Status',1)+h"
+          "+'<div style=\"font-size:11px;color:#95a5a6;margin-top:4px\">dBHz: 40+ strong, 30-40 good, 25-30 weak, under 25 marginal</div>';"
           "document.getElementById('gdsv').innerHTML=h||'none';"
           "st('gdant',g.ant,g.ant=='OK');"
           "st('gdhw',g.hwage<0?'no data':'noise '+g.noise+', AGC '+g.agc+' ('+Math.round(g.agc/81.91)+'%)');}"
@@ -566,25 +571,55 @@ static void handleWiFi() {
   }
   html += "</div>";
 
+  // Add or replace one network (defaults to the first empty one)
+  int firstEmpty = 0;
+  for (int i = 0; i < WIFI_MAX_NETS; i++) {
+    if (!cfg.wifiSsid(i)[0]) {
+      firstEmpty = i;
+      break;
+    }
+  }
+  html += "<div class=\"card\" id=\"addnet\"><h2>Add / Change Network</h2><form method=\"POST\" action=\"/wifi\">";
+  html += "<label>Network:</label><select name=\"slot\" id=\"wslot\">";
+  for (int i = 0; i < WIFI_MAX_NETS; i++) {
+    html += "<option value=\"" + String(i) + "\"" + (i == firstEmpty ? " selected" : "") + ">Network " + String(i + 1) +
+            " - " + (cfg.wifiSsid(i)[0] ? htmlEscape(cfg.wifiSsid(i)) + " (replace)" : String("empty")) + "</option>";
+  }
+  html += "</select>";
+  html += "<button type=\"button\" class=\"btn\" onclick=\"scanWifi()\">Scan for Networks</button>";
+  html += "<span id=\"scanStatus\"></span>"
+          "<select id=\"scanList\" style=\"display:none\" onchange=\"pickNet(this)\"></select>";
+  html += "<label>SSID:</label><input type=\"text\" id=\"ssid\" name=\"ssid\" maxlength=\"32\" required>";
+  html += "<label>Password:</label><input type=\"password\" id=\"wpass\" name=\"pass\" maxlength=\"64\" "
+          "placeholder=\"blank = open network, or keep the saved one if the SSID is unchanged\">";
+  html += "<label><input type=\"checkbox\" onclick=\"document.getElementById('wpass').type=this.checked?'text':'password'\">"
+          " Show password</label>";
+  html += "<p>Passwords are never shown once saved. Save applies right away: it reconnects only if this "
+          "changes the network in use (or WiFi isn't connected).</p>";
+  html += "<button type=\"submit\" name=\"action\" value=\"save\" class=\"btn\">Save</button> "
+          "<button type=\"submit\" name=\"action\" value=\"reboot\" class=\"btn\">Save &amp; Reboot</button></form></div>";
+
   // Saved networks: one row per slot, each with its own Clear button
-  html += "<div class=\"card\"><h2>Saved Networks</h2><table>"
-          "<tr><th>Network</th><th>SSID</th><th>Password</th><th></th></tr>";
-  int firstEmpty = -1;
+  html += "<style>.wt th,.wt td{text-align:left;padding:6px 8px;vertical-align:middle;border-bottom:1px solid #2c3e50}"
+          ".wt th{color:#95a5a6;font-weight:normal;font-size:14px}.wt .n{width:2em}.wt .a{text-align:right;white-space:nowrap}"
+          ".wt .sb{padding:4px 12px;font-size:14px;margin:0 0 0 6px}.wt form{display:inline;margin:0}"
+          ".wt .e{color:#7f8c8d;font-style:italic}</style>";
+  html += "<div class=\"card\"><h2>Saved Networks</h2><table class=\"wt\">"
+          "<tr><th class=\"n\">#</th><th>SSID</th><th>Security</th><th></th></tr>";
   for (int i = 0; i < WIFI_MAX_NETS; i++) {
     bool saved = cfg.wifiSsid(i)[0] != '\0';
-    if (!saved && firstEmpty < 0)
-      firstEmpty = i;
     bool inUse = net.mode() == NetMode::WIFI_ACTIVE && net.wifiNetIndex() == i;
-    html += "<tr><td>" + String(i + 1) + "</td><td>";
-    html += saved ? htmlEscape(cfg.wifiSsid(i)) + (inUse ? " <span class=\"status ok\">in use</span>" : "")
-                  : String("<i>empty</i>");
-    html += "</td><td>" + String(saved ? (cfg.wifiPass(i)[0] ? "saved" : "none (open)") : "") + "</td><td>";
-    if (saved) {
-      html += "<form method=\"POST\" action=\"/wifi/clear\" style=\"margin:0\" onsubmit=\"return confirm('Clear network " +
-              String(i + 1) + "?')\"><input type=\"hidden\" name=\"slot\" value=\"" + String(i) +
-              "\"><input type=\"submit\" value=\"Clear\" class=\"btn\"></form>";
+    html += "<tr><td class=\"n\">" + String(i + 1) + "</td>";
+    if (!saved) {
+      html += "<td class=\"e\" colspan=\"3\">empty</td></tr>";
+      continue;
     }
-    html += "</td></tr>";
+    html += "<td>" + htmlEscape(cfg.wifiSsid(i)) + (inUse ? " <span class=\"status ok\">in use</span>" : "") + "</td>";
+    html += String("<td>") + (cfg.wifiPass(i)[0] ? "password" : "open") + "</td><td class=\"a\">";
+    html += "<button type=\"button\" class=\"btn sb\" onclick=\"editNet(" + String(i) + ")\">Edit</button>";
+    html += "<form method=\"POST\" action=\"/wifi/clear\" onsubmit=\"return confirm('Clear network " + String(i + 1) +
+            "?')\"><input type=\"hidden\" name=\"slot\" value=\"" + String(i) +
+            "\"><input type=\"submit\" value=\"Clear\" class=\"btn sb\"></form></td></tr>";
   }
   html += "</table>";
   html += "<form method=\"POST\" action=\"/wifi/pin\">";
@@ -600,42 +635,33 @@ static void handleWiFi() {
   html += "</select><button type=\"submit\" name=\"action\" value=\"save\" class=\"btn\">Save</button> "
           "<button type=\"submit\" name=\"action\" value=\"reboot\" class=\"btn\">Save &amp; Reboot</button></form></div>";
 
-  // Add or replace one network
-  if (firstEmpty < 0)
-    firstEmpty = 0;
-  html += "<div class=\"card\"><h2>Add / Change Network</h2><form method=\"POST\" action=\"/wifi\">";
-  html += "<label>Network:</label><select name=\"slot\">";
+  html += "<script>var wsids=[";
   for (int i = 0; i < WIFI_MAX_NETS; i++) {
-    html += "<option value=\"" + String(i) + "\"" + (i == firstEmpty ? " selected" : "") + ">Network " + String(i + 1) +
-            " - " + (cfg.wifiSsid(i)[0] ? htmlEscape(cfg.wifiSsid(i)) + " (replace)" : String("empty")) + "</option>";
+    String s = cfg.wifiSsid(i);
+    s.replace("\\", "\\\\");
+    s.replace("\"", "\\\"");
+    s.replace("<", "\\x3c");
+    html += (i ? ",\"" : "\"") + s + "\"";
   }
-  html += "</select>";
-  html += "<label>SSID:</label><input type=\"text\" id=\"ssid\" name=\"ssid\" maxlength=\"32\" required>";
-  html += "<button type=\"button\" class=\"btn\" onclick=\"scanWifi()\">Scan for Networks</button>";
-  html += "<div id=\"scanStatus\"></div><div id=\"scanList\"></div>";
-  html += "<label>Password:</label><input type=\"password\" id=\"wpass\" name=\"pass\" maxlength=\"64\" "
-          "placeholder=\"blank = open network, or keep the saved one if the SSID is unchanged\">";
-  html += "<label><input type=\"checkbox\" onclick=\"document.getElementById('wpass').type=this.checked?'text':'password'\">"
-          " Show password</label>";
-  html += "<p>Passwords are never shown once saved. Save applies right away: it reconnects only if this "
-          "changes the network in use (or WiFi isn't connected).</p>";
-  html += "<button type=\"submit\" name=\"action\" value=\"save\" class=\"btn\">Save</button> "
-          "<button type=\"submit\" name=\"action\" value=\"reboot\" class=\"btn\">Save &amp; Reboot</button></form></div>";
-
-  html += "<script>";
+  html += "];";
+  html += "function editNet(i){document.getElementById('wslot').value=i;document.getElementById('ssid').value=wsids[i];"
+          "document.getElementById('wpass').value='';document.getElementById('addnet').scrollIntoView();"
+          "document.getElementById('wpass').focus();}";
   html += "function scanWifi(){document.getElementById('scanStatus').innerText='Scanning...';"
-          "document.getElementById('scanList').innerHTML='';fetch('/wifi/scan',{method:'POST'}).then(pollScan);}";
+          "document.getElementById('scanList').style.display='none';fetch('/wifi/scan',{method:'POST'}).then(pollScan);}";
+  html += "function pickNet(s){if(!s.value)return;document.getElementById('ssid').value=s.value;"
+          "document.getElementById('wpass').focus();}";
   // Results: one network per line, "ssid<TAB>rssi<TAB>secure", strongest first
   html += "function pollScan(){fetch('/wifi/scan_results').then(function(r){return r.text();}).then(function(text){"
           "if(text==='running'){setTimeout(pollScan,1000);return;}"
           "var nets=text.split('\\n').filter(function(s){return s.length>0;}).map(function(l){return l.split('\\t');});"
-          "var box=document.getElementById('scanList');box.innerHTML='';"
-          "nets.forEach(function(n){var b=document.createElement('button');b.type='button';b.className='btn';"
-          "b.style.display='block';b.style.margin='4px 0';"
-          "b.textContent=n[0]+'  ('+n[1]+' dBm'+(n[2]=='1'?', secured':', open')+')';"
-          "b.onclick=function(){document.getElementById('ssid').value=n[0];document.getElementById('wpass').focus();};"
-          "box.appendChild(b);});"
-          "document.getElementById('scanStatus').innerText=nets.length?'Pick a network:':'No networks found';"
+          "var sel=document.getElementById('scanList');sel.innerHTML='';"
+          "var o=document.createElement('option');o.value='';o.textContent='Pick a network ('+nets.length+' found)';"
+          "sel.appendChild(o);"
+          "nets.forEach(function(n){var o=document.createElement('option');o.value=n[0];"
+          "o.textContent=n[0]+'  ('+n[1]+' dBm, '+(n[2]=='1'?'secured':'open')+')';sel.appendChild(o);});"
+          "sel.style.display=nets.length?'':'none';"
+          "document.getElementById('scanStatus').innerText=nets.length?'':'No networks found';"
           "});}";
   html += "</script>";
   html += htmlFooter();
@@ -1066,8 +1092,17 @@ static void handleWg() {
 
   html += "<div class=\"card\"><h2>WireGuard Remote Access</h2><table>";
   html += "<tr><td>Tunnel</td><td>" + htmlEscape(state) + "</td></tr>";
-  html += String("<tr><td>This device's public key</td><td><code>") +
-          (havePriv ? pub : "(no private key yet)") + "</code></td></tr></table>";
+  html += String("<tr><td>This device's public key</td><td><code id=\"wgpub\">") +
+          (havePriv ? pub : "(no private key yet)") + "</code>";
+  if (havePriv) {
+    // Plain HTTP: navigator.clipboard is unavailable, so fall back to select + execCommand
+    html += " <button type=\"button\" class=\"btn\" style=\"padding:4px 12px;font-size:14px\" onclick=\"var t=document."
+            "createElement('textarea');t.value=document.getElementById('wgpub').textContent;document.body.appendChild(t);"
+            "t.select();var ok=false;try{ok=document.execCommand('copy');}catch(e){}document.body.removeChild(t);"
+            "this.textContent=ok?'Copied':'Copy failed';var b=this;setTimeout(function(){b.textContent='Copy';},1500);\">"
+            "Copy</button>";
+  }
+  html += "</td></tr></table>";
   html += "<p>Split tunnel: only the tunnel subnet and the remote subnets below go through WireGuard. "
           "Everything else stays on Ethernet/WiFi.</p>";
   html += "<form method=\"POST\" action=\"/wireguard/genkey\" onsubmit=\"return confirm('Replace the private key? "
@@ -1202,29 +1237,13 @@ static void handleGps() {
   }
   html += "<input type=\"submit\" value=\"Save &amp; Reboot\" class=\"btn\"></form></div>";
 
-  // Start-up aiding position
-  const GpsAidConfig &a = cfg.gpsAid;
-  html += "<div class=\"card\"><h2>GPS Start-up Aiding</h2><form method=\"POST\" action=\"/gps/aid\">";
-  html += "<p>At boot the GPS is given the network (NTP) time and this position so it searches for the "
-          "right satellites. If no satellites are used for 5 minutes it is cold started (then at most every 20 minutes). "
-          "Within a few km is plenty. Blank = use the survey position, if any.</p>";
-  html += "<label>Latitude (decimal degrees):</label><input type=\"text\" name=\"lat\" placeholder=\"example: 32.7767\" value=\"" +
-          (a.set ? String(a.latE7 / 1e7, 7) : String("")) + "\">";
-  html += "<label>Longitude (decimal degrees, west negative):</label><input type=\"text\" name=\"lon\" placeholder=\"example: -96.7970\" value=\"" +
-          (a.set ? String(a.lonE7 / 1e7, 7) : String("")) + "\">";
-  html += "<label>Height (m):</label><input type=\"text\" name=\"alt\" placeholder=\"example: 150\" value=\"" +
-          (a.set ? String(a.altCm / 100.0, 1) : String("")) + "\">";
-  double clat, clon, calt;
-  if (gps.getCurrentPosition(&clat, &clon, &calt)) {
-    html += "<p>Current GPS position: " + String(clat, 7) + ", " + String(clon, 7) + ", height " + String(calt, 1) + " m</p>";
-  } else {
-    html += "<p>Current GPS position: no fix.</p>";
-  }
+  // Start-up aiding (network time only)
+  html += "<div class=\"card\"><h2>GPS Start-up Aiding</h2>";
+  html += "<p>At boot the GPS is given the network (NTP) time. If no satellites are used for 5 minutes it is "
+          "cold started (then at most every 20 minutes).</p>";
   char aid[128];
   gps.aidSummary(aid, sizeof(aid));
   html += String("<p>") + aid + "</p>";
-  html += "<input type=\"submit\" name=\"save\" value=\"Save\" class=\"btn\"> "
-          "<input type=\"submit\" name=\"usefix\" value=\"Use current GPS position\" class=\"btn\"></form>";
   html += "<form method=\"POST\" action=\"/gps/cold\" onsubmit=\"return confirm('Cold start the GPS? It erases its almanac, "
           "ephemeris, position and time. GPS lock is lost until it gets a new fix.')\">"
           "<input type=\"submit\" value=\"Cold start GPS\" class=\"btn\"></form></div>";
@@ -1237,41 +1256,6 @@ static void handleGps() {
   html += "<input type=\"submit\" value=\"Save\" class=\"btn\"></form></div>";
   html += htmlFooter();
   webServer.send(200, "text/html", html);
-}
-
-static void handleGpsAidPost() {
-  GpsAidConfig &a = cfg.gpsAid;
-  double lat, lon, alt;
-  bool ok;
-  if (webServer.hasArg("usefix")) {
-    ok = gps.getCurrentPosition(&lat, &lon, &alt);
-  } else {
-    String sLat = webServer.arg("lat"), sLon = webServer.arg("lon"), sAlt = webServer.arg("alt");
-    sLat.trim();
-    sLon.trim();
-    sAlt.trim();
-    if (sLat.length() == 0 && sLon.length() == 0) {
-      a.set = false; // blank = clear
-      ok = false;
-    } else {
-      lat = atof(sLat.c_str());
-      lon = atof(sLon.c_str());
-      alt = atof(sAlt.c_str());
-      ok = sLat.length() && sLon.length() && fabs(lat) <= 90.0 && fabs(lon) <= 180.0;
-    }
-  }
-  if (ok) {
-    a.set = true;
-    a.latE7 = (int32_t)lround(lat * 1e7);
-    a.lonE7 = (int32_t)lround(lon * 1e7);
-    a.altCm = (int32_t)lround(constrain(alt, -1000.0, 9000.0) * 100.0);
-  }
-  if (ok || !a.set) {
-    cfg.saveGpsAid();
-    gps.requestAid(); // sent now if the GPS has no satellites yet
-  }
-  webServer.sendHeader("Location", "/gps", true);
-  webServer.send(303, "text/plain", "");
 }
 
 static void handleGpsColdPost() {
@@ -1395,8 +1379,18 @@ static void handleBackup() {
 
 static void handleBackupExport() {
   String name = cfg.data.deviceHostname[0] ? String(cfg.data.deviceHostname) : String(DEVICE_TYPE);
+  // UTC date/time stamp: NTP clock, else GPS time, else none
+  time_t now = time(nullptr);
+  if (now < 1700000000 && gps.isTimeSet())
+    now = (time_t)gps.getEpoch();
+  char ts[24] = "";
+  if (now >= 1700000000) {
+    struct tm tm;
+    gmtime_r(&now, &tm);
+    strftime(ts, sizeof(ts), "-%Y%m%d-%H%M%SZ", &tm);
+  }
   webServer.sendHeader("Content-Disposition",
-                       "attachment; filename=\"" + name + "-" DEVICE_TYPE "-config.json\"");
+                       "attachment; filename=\"" + name + "-" DEVICE_TYPE "-config" + String(ts) + ".json\"");
   webServer.send(200, "application/json", configExportJson());
 }
 
@@ -1476,7 +1470,6 @@ void webBegin() {
   webServer.on("/wireguard/genkey", HTTP_POST, handleWgGenKey);
   webServer.on("/gps", HTTP_GET, handleGps);
   webServer.on("/gps", HTTP_POST, handleGpsPost);
-  webServer.on("/gps/aid", HTTP_POST, handleGpsAidPost);
   webServer.on("/gps/cold", HTTP_POST, handleGpsColdPost);
   webServer.on("/gps/diag", HTTP_POST, handleGpsDiagPost);
   webServer.on("/backup", HTTP_GET, handleBackup);

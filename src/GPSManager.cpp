@@ -46,7 +46,6 @@ static const uint8_t TMODE_MAX_SETS = 3; // per boot - each one writes GPS flash
 
 // Aiding
 static const uint32_t AID_TIME_ACC_MS = 1000;      // NTP time handed to the GPS, claimed accuracy
-static const uint32_t AID_POS_ACC_CM = 10000;      // entered / NMEA position, claimed accuracy (100 m)
 static const uint32_t COLD_FIRST_MS = 5 * 60000;   // no satellites this long after boot -> cold start
 static const uint32_t COLD_REPEAT_MS = 20 * 60000; // then at most this often
 static const uint32_t COLD_AID_DELAY_MS = 5000;    // cold start -> aid again, GPS restarting and old NMEA gone
@@ -227,6 +226,10 @@ void GPSManager::_sendMsgConfig() {
     uint8_t p[3] = {m[0], m[1], 1};
     _ubxSend(UBX_CLS_CFG, UBX_CFG_MSG, p, sizeof(p));
   }
+  // Antenna open-circuit detection: read CFG-ANT, the reply turns it on
+  // (RAM only, so redone every boot / hardware reset)
+  _antOcdSent = false;
+  _ubxSend(UBX_CLS_CFG, UBX_CFG_ANT, nullptr, 0);
 }
 
 void GPSManager::update() {
@@ -451,26 +454,10 @@ void GPSManager::_ubxSend(uint8_t cls, uint8_t id, const uint8_t *payload, uint1
 
 // AID-INI (48 bytes): pos X/lat, Y/lon, Z/alt I4, posAcc U4 (cm), tmCfg X2,
 // wn U2, tow U4 (ms), towNs I4, tAccMs U4, tAccNs U4, clkD I4, clkDAcc U4,
-// flags X4 (0x01 position valid, 0x02 time valid, 0x20 position is lat/lon/alt)
+// flags X4 (0x02 time valid). Time only: position aiding slowed locks down.
 bool GPSManager::_sendAidIni() {
   uint8_t p[48] = {0};
   uint32_t flags = 0;
-  const GpsAidConfig &a = cfg.gpsAid;
-  const GpsTimingConfig &t = cfg.gpsTm;
-  if (a.set) {
-    wrU4(p, (uint32_t)a.latE7);
-    wrU4(p + 4, (uint32_t)a.lonE7);
-    wrU4(p + 8, (uint32_t)a.altCm);
-    wrU4(p + 12, AID_POS_ACC_CM);
-    flags |= 0x01 | 0x20;
-  } else if (t.fixedX || t.fixedY || t.fixedZ) {
-    wrU4(p, (uint32_t)t.fixedX);
-    wrU4(p + 4, (uint32_t)t.fixedY);
-    wrU4(p + 8, (uint32_t)t.fixedZ);
-    uint32_t accCm = t.fixedAccMm / 10;
-    wrU4(p + 12, accCm < 100 ? 100 : accCm);
-    flags |= 0x01;
-  }
 
   struct timeval tv;
   gettimeofday(&tv, nullptr);
@@ -486,16 +473,14 @@ bool GPSManager::_sendAidIni() {
   }
 
   if (!flags) {
-    logger.info("GPS", "No network time or saved position - no aiding sent");
+    logger.info("GPS", "No network time - no aiding sent");
     return false;
   }
   wrU4(p + 44, flags);
   _ubxSend(UBX_CLS_AID, UBX_AID_INI, p, sizeof(p));
   _aidSentMs = millis();
   _aidFlags = flags;
-  logger.info("GPS", "Aiding sent: %s%s%s", (flags & 0x02) ? "network time" : "",
-              (flags & 0x03) == 0x03 ? " + " : "",
-              (flags & 0x01) ? (a.set ? "saved position" : "survey position") : "");
+  logger.info("GPS", "Aiding sent: network time");
   // Decoded from the payload, so this is what actually went to the GPS
   if (flags & 0x02) {
     time_t sec = tv.tv_sec;
@@ -554,26 +539,10 @@ void GPSManager::_coldStart(const char *why) {
 
 void GPSManager::coldStart() { _coldStart("Web page request"); }
 
-void GPSManager::requestAid() {
-  _aidPending = true;
-  _aidNotBefore = millis();
-}
-
-bool GPSManager::getCurrentPosition(double *latDeg, double *lonDeg, double *altM) {
-  if (!_gpsParser.location.isValid() || _gpsParser.location.age() > 5000)
-    return false;
-  *latDeg = _gpsParser.location.lat();
-  *lonDeg = _gpsParser.location.lng();
-  *altM = _gpsParser.altitude.isValid() ? _gpsParser.altitude.meters() : 0.0;
-  return true;
-}
-
 void GPSManager::aidSummary(char *buf, size_t len) {
   char sent[64];
   if (_aidSentMs) {
-    snprintf(sent, sizeof(sent), "sent %lu s after boot (%s%s%s)", (unsigned long)(_aidSentMs / 1000),
-             (_aidFlags & 0x02) ? "time" : "", (_aidFlags & 0x03) == 0x03 ? " + " : "",
-             (_aidFlags & 0x01) ? "position" : "");
+    snprintf(sent, sizeof(sent), "sent %lu s after boot (network time)", (unsigned long)(_aidSentMs / 1000));
   } else {
     snprintf(sent, sizeof(sent), "%s", _aidPending ? "waiting" : "not needed (already tracking)");
   }
@@ -821,6 +790,16 @@ void GPSManager::_ubxHandle() {
       uint16_t f = rdU2(p);
       logger.info("GPS", "CFG-ANT: supply ctrl %u, short det %u, open det %u, off on short %u, auto recovery %u",
                   f & 1, (f >> 1) & 1, (f >> 2) & 1, (f >> 3) & 1, (f >> 4) & 1);
+      // flags X2 (0x01 supply control, 0x04 open-circuit detection), pins X2
+      // kept as the module has them. Written once; the poll after it confirms.
+      if ((f & 0x05) != 0x05 && !_antOcdSent) {
+        _antOcdSent = true;
+        uint16_t nf = f | 0x05;
+        uint8_t w[4] = {(uint8_t)(nf & 0xFF), (uint8_t)(nf >> 8), p[2], p[3]};
+        _ubxSend(UBX_CLS_CFG, UBX_CFG_ANT, w, sizeof(w));
+        _ubxSend(UBX_CLS_CFG, UBX_CFG_ANT, nullptr, 0);
+        logger.info("GPS", "CFG-ANT: open-circuit detection turned on");
+      }
     } else if (_ubxId == UBX_CFG_SBAS && _ubxLen >= 8) {
       logger.info("GPS", "CFG-SBAS: mode 0x%02X, usage 0x%02X, maxSBAS %u", p[0], p[1], p[2]);
     }

@@ -84,10 +84,6 @@ String configExportJson() {
   g["fixedAccMm"] = t.fixedAccMm;
 
   JsonObject a = doc["gpsAid"].to<JsonObject>();
-  a["set"] = cfg.gpsAid.set;
-  a["latE7"] = cfg.gpsAid.latE7;
-  a["lonE7"] = cfg.gpsAid.lonE7;
-  a["altCm"] = cfg.gpsAid.altCm;
   a["diag"] = cfg.gpsAid.diag;
 
   const RptConfig &p = cfg.rpt;
@@ -298,10 +294,6 @@ bool configImportJson(const char *json, size_t len, String &err) {
   getU32(g, "fixedAccMm", t.fixedAccMm);
 
   JsonObjectConst ai = doc["gpsAid"];
-  getBool(ai, "set", a.set);
-  getI32(ai, "latE7", a.latE7);
-  getI32(ai, "lonE7", a.lonE7);
-  getI32(ai, "altCm", a.altCm);
   getBool(ai, "diag", a.diag);
 
   JsonObjectConst rp = doc["repeater"];
